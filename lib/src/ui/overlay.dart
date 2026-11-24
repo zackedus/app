@@ -1,7 +1,14 @@
 part of '../../main.dart';
 
 class _Detection {
-  const _Detection(this.box, this.label, this.score, this.appearance, {this.local = false});
+  const _Detection(
+    this.box,
+    this.label,
+    this.score,
+    this.appearance, {
+    this.local = false,
+    this.trackId,
+  });
 
   factory _Detection.fromMap(Map<Object?, Object?> map) {
     double number(String key) => (map[key] as num).toDouble();
@@ -24,17 +31,49 @@ class _Detection {
   _Detection asLocal(String exampleLabel) =>
       _Detection(box, exampleLabel, score, appearance, local: true);
 
+  _Detection withTrack(int? id) =>
+      _Detection(box, label, score, appearance, local: local, trackId: id);
+
+  /// Text shown on the box, on screen and in saved photos.
+  String caption({bool showTrack = false}) {
+    final name = displayLabel(label);
+    final text = local ? '$name · contoh' : '$name ${(100 * score).round()}%';
+    return showTrack && trackId != null ? '#$trackId $text' : text;
+  }
+
   final Rect box;
   final String label;
   final double score;
   final List<double> appearance;
   final bool local;
+  final int? trackId;
 }
 
+String displayLabel(String label) => cocoLabelsId[label] ?? label;
+
+/// Keeps detections the user wants to see: example matches always, detector
+/// boxes above the score threshold, and only labels that are switched on.
+List<_Detection> _visibleDetections(
+  List<_Detection> raw,
+  List<String?> exampleLabels,
+  DetectionSettings settings,
+) =>
+    [
+      for (var i = 0; i < raw.length; i++)
+        if (i < exampleLabels.length && exampleLabels[i] != null)
+          raw[i].asLocal(exampleLabels[i]!)
+        else
+          raw[i],
+    ]
+        .where((d) => (d.local || d.score >= settings.minScore) && settings.shows(d.label))
+        .take(8)
+        .toList();
+
 class _Overlay extends CustomPainter {
-  const _Overlay(this.detections, {this.focus = false});
+  const _Overlay(this.detections, {this.focus = false, this.showTracks = false});
 
   final bool focus;
+  final bool showTracks;
 
   final List<_Detection> detections;
   static const _accent = Color(0xff79ebbb);
@@ -66,10 +105,9 @@ class _Overlay extends CustomPainter {
       ).intersect(Offset.zero & size);
       if (rect.isEmpty) continue;
       canvas.drawRect(rect, border);
-      final label = cocoLabelsId[detection.label] ?? detection.label;
       final text = TextPainter(
         text: TextSpan(
-          text: detection.local ? '$label · contoh' : '$label ${(100 * detection.score).round()}%',
+          text: detection.caption(showTrack: showTracks),
           style: const TextStyle(color: Colors.black, fontSize: 13),
         ),
         maxLines: 1,
@@ -89,5 +127,7 @@ class _Overlay extends CustomPainter {
 
   @override
   bool shouldRepaint(_Overlay oldDelegate) =>
-      detections != oldDelegate.detections || focus != oldDelegate.focus;
+      detections != oldDelegate.detections ||
+      focus != oldDelegate.focus ||
+      showTracks != oldDelegate.showTracks;
 }

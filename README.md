@@ -21,6 +21,13 @@ Untuk membuat APK pengujian, jalankan `flutter build apk --debug` di folder `obj
 - Pindah ke aplikasi lain lalu kembali. Kamera dan deteksi seharusnya aktif kembali.
 - Aktifkan mode pesawat dan ulangi deteksi.
 
+## Fitur lapangan
+
+- **Simpan foto**: menyimpan frame kamera beserta kotak, label, waktu, lokasi GPS terakhir (bisa dimatikan), ringkasan objek, dan nama model ke `Pictures/DeteksiObjek/`. Ada tombol **Bagikan** setelah tersimpan.
+- **Hitung objek**: pelacakan antar-frame (IoU); objek dihitung sekali setelah terlihat 3 frame. Panel menampilkan jumlah yang terlihat dan total, plus tombol reset.
+- **Deteksi dari foto** (menu ⋮): pilih foto dari HP, lihat hasil deteksi, simpan hasilnya, atau jadikan contoh dataset dengan kotak deteksi sebagai anotasi awal.
+- **Pengaturan deteksi** (menu ⋮): ambang keyakinan, batas frame per detik (hemat baterai), lokasi di foto, dan pilihan kelas yang ditampilkan.
+
 ## Objek kustom dan dataset
 
 - Tombol **Tambahkan objek baru** memotret contoh. Jika API key OpenRouter diisi, foto bisa dianotasi otomatis (default `google/gemini-3.8-flash`, format kotak bawaan Gemini `box_2d` 0–1000; Qwen `bbox_2d` juga dibaca), lalu dikoreksi manual.

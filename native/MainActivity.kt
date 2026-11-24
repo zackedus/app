@@ -6,7 +6,12 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.imageembedder.ImageEmbedder
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
+import android.Manifest
 import android.content.ContentValues
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.LocationManager
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -46,6 +51,14 @@ class MainActivity : FlutterActivity() {
     private var customDetector: RfDetrDetector? = null
     private var customChecked = false
     private var customError: String? = null
+    private var keptFrame: Bitmap? = null
+    private var pendingPick: MethodChannel.Result? = null
+    private var pendingLocation: MethodChannel.Result? = null
+
+    private companion object {
+        const val REQUEST_PICK = 4101
+        const val REQUEST_LOCATION = 4102
+    }
     private var embedder: ImageEmbedder? = null
     private var embeddingUnavailable = false
     private var channel: MethodChannel? = null
@@ -58,10 +71,30 @@ class MainActivity : FlutterActivity() {
             "object_detection/detector"
         ).also { bridge ->
             bridge.setMethodCallHandler { call, result ->
-                if (call.method != "detect" && call.method != "learnPhoto" &&
-                    call.method != "exportDataset" && call.method != "detectorInfo") {
-                    result.notImplemented()
-                    return@setMethodCallHandler
+                when (call.method) {
+                    "share" -> {
+                        try {
+                            sharePhoto(requireNotNull(call.argument<String>("uri")))
+                            result.success(null)
+                        } catch (error: Exception) {
+                            result.error("SHARE", error.message, null)
+                        }
+                        return@setMethodCallHandler
+                    }
+                    "pickPhoto" -> {
+                        pickPhoto(result)
+                        return@setMethodCallHandler
+                    }
+                    "location" -> {
+                        requestLocation(result)
+                        return@setMethodCallHandler
+                    }
+                    "detect", "learnPhoto", "exportDataset", "detectorInfo",
+                    "detectPhoto", "saveSnapshot" -> Unit
+                    else -> {
+                        result.notImplemented()
+                        return@setMethodCallHandler
+                    }
                 }
                 // Export can take a while, so it runs outside the frame worker.
                 val executor = if (call.method == "exportDataset") exportWorker else worker
@@ -71,6 +104,8 @@ class MainActivity : FlutterActivity() {
                             "detect" -> detect(call)
                             "learnPhoto" -> learnPhoto(call)
                             "detectorInfo" -> detectorInfo()
+                            "detectPhoto" -> detectPhoto(call)
+                            "saveSnapshot" -> saveSnapshot(call)
                             else -> exportDataset(call)
                         }
                         runOnUiThread { result.success(detections) }
@@ -163,17 +198,7 @@ class MainActivity : FlutterActivity() {
         val rotation = requireNotNull(call.argument<Int>("rotation"))
         val focus = call.argument<Boolean>("focus") == true
         val compareExamples = call.argument<Boolean>("compareExamples") == true
-        val custom = customModel()
-        val model = if (custom != null) null else detector ?: ObjectDetector.createFromOptions(
-            applicationContext,
-            ObjectDetector.ObjectDetectorOptions.builder()
-                .setBaseOptions(BaseOptions.builder().setModelAssetPath("model.tflite").build())
-                .setRunningMode(RunningMode.IMAGE)
-                .setMaxResults(16)
-                .setScoreThreshold(0.20f)
-                .build()
-        ).also { detector = it }
-
+        val keepFrame = call.argument<Boolean>("keepFrame") == true
         require(width > 0 && height > 0 && bytes.size == width * height * 3 / 2)
         val bitmap = nv21ToBitmap(bytes, width, height)
         try {
@@ -182,39 +207,204 @@ class MainActivity : FlutterActivity() {
                 Matrix().apply { postRotate(rotation.toFloat()) }, true
             )
             try {
-                if (focus) {
-                    val box = RectF(
-                        upright.width * .2f, upright.height * .3f,
-                        upright.width * .8f, upright.height * .7f
-                    )
-                    return listOf(candidate(upright, box, "", 0.0, true))
+                if (keepFrame) {
+                    // Kept as a copy: the frame and its MPImage are recycled below.
+                    keptFrame?.recycle()
+                    keptFrame = upright.copy(Bitmap.Config.ARGB_8888, false)
                 }
-                if (custom != null) {
-                    return custom.detect(upright, 0.35f, 16).mapIndexed { index, found ->
-                        candidate(upright, found.box, found.label, found.score.toDouble(),
-                            compareExamples && index < 8)
-                    }
-                }
-                // Closing an MPImage may recycle its bitmap, so close it only after all crops.
-                val input = BitmapImageBuilder(upright).build()
-                try {
-                    return checkNotNull(model).detect(input).detections().mapNotNull { detection ->
-                        val category = detection.categories().maxByOrNull { it.score() }
-                            ?: return@mapNotNull null
-                        Triple(detection.boundingBox(), category.categoryName(), category.score())
-                    }.sortedByDescending { it.third }.mapIndexed { index, (box, label, score) ->
-                        // The UI shows at most eight boxes, so each of them can match examples.
-                        candidate(upright, box, label, score.toDouble(), compareExamples && index < 8)
-                    }
-                } finally {
-                    input.close()
-                }
+                return detectBitmap(upright, focus, compareExamples)
             } finally {
                 if (upright !== bitmap) upright.recycle()
             }
         } finally {
             bitmap.recycle()
         }
+    }
+
+    private fun objectDetector(): ObjectDetector = detector ?: ObjectDetector.createFromOptions(
+        applicationContext,
+        ObjectDetector.ObjectDetectorOptions.builder()
+            .setBaseOptions(BaseOptions.builder().setModelAssetPath("model.tflite").build())
+            .setRunningMode(RunningMode.IMAGE)
+            .setMaxResults(16)
+            .setScoreThreshold(0.20f)
+            .build()
+    ).also { detector = it }
+
+    private fun detectBitmap(
+        upright: Bitmap, focus: Boolean, compareExamples: Boolean
+    ): List<Map<String, Any>> {
+        if (focus) {
+            val box = RectF(
+                upright.width * .2f, upright.height * .3f,
+                upright.width * .8f, upright.height * .7f
+            )
+            return listOf(candidate(upright, box, "", 0.0, true))
+        }
+        val custom = customModel()
+        if (custom != null) {
+            return custom.detect(upright, 0.2f, 16).mapIndexed { index, found ->
+                candidate(upright, found.box, found.label, found.score.toDouble(),
+                    compareExamples && index < 8)
+            }
+        }
+        // Closing an MPImage may recycle its bitmap, so close it only after all crops.
+        val input = BitmapImageBuilder(upright).build()
+        try {
+            return objectDetector().detect(input).detections().mapNotNull { detection ->
+                val category = detection.categories().maxByOrNull { it.score() }
+                    ?: return@mapNotNull null
+                Triple(detection.boundingBox(), category.categoryName(), category.score())
+            }.sortedByDescending { it.third }.mapIndexed { index, (box, label, score) ->
+                // The UI shows at most eight boxes, so each of them can match examples.
+                candidate(upright, box, label, score.toDouble(), compareExamples && index < 8)
+            }
+        } finally {
+            input.close()
+        }
+    }
+
+    private fun detectPhoto(call: MethodCall): Map<String, Any> {
+        val path = requireNotNull(call.argument<String>("path"))
+        requireAppFile(path)
+        val compareExamples = call.argument<Boolean>("compareExamples") == true
+        val photo = decodePhoto(path)
+        val width = photo.width
+        val height = photo.height
+        try {
+            return mapOf(
+                "width" to width,
+                "height" to height,
+                "detections" to detectBitmap(photo, false, compareExamples),
+            )
+        } finally {
+            photo.recycle()
+        }
+    }
+
+    // Draws the boxes the UI shows onto the kept camera frame or a photo and saves it.
+    private fun saveSnapshot(call: MethodCall): Map<String, String> {
+        val path = call.argument<String>("path")
+        val boxes = requireNotNull(call.argument<List<List<Number>>>("boxes"))
+        val labels = requireNotNull(call.argument<List<String>>("labels"))
+        val caption = call.argument<String>("caption").orEmpty()
+        val source = if (path != null) {
+            requireAppFile(path)
+            decodePhoto(path)
+        } else {
+            checkNotNull(keptFrame) { "Frame kamera belum tersedia" }.also { keptFrame = null }
+        }
+        try {
+            val annotated = PhotoTools.annotate(source, boxes, labels, caption)
+            try {
+                val (location, uri) = PhotoTools.saveJpeg(
+                    applicationContext, annotated, "deteksi_${System.currentTimeMillis()}.jpg"
+                )
+                return mapOf("location" to location, "uri" to (uri?.toString() ?: ""))
+            } finally {
+                annotated.recycle()
+            }
+        } finally {
+            source.recycle()
+        }
+    }
+
+    private fun sharePhoto(uri: String) {
+        val intent = Intent(Intent.ACTION_SEND)
+            .setType("image/jpeg")
+            .putExtra(Intent.EXTRA_STREAM, Uri.parse(uri))
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        startActivity(Intent.createChooser(intent, "Bagikan foto deteksi"))
+    }
+
+    private fun pickPhoto(result: MethodChannel.Result) {
+        if (pendingPick != null) {
+            result.error("BUSY", "Pemilih foto sedang terbuka", null)
+            return
+        }
+        pendingPick = result
+        val intent = Intent(Intent.ACTION_GET_CONTENT)
+            .setType("image/*")
+            .addCategory(Intent.CATEGORY_OPENABLE)
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(Intent.createChooser(intent, "Pilih foto"), REQUEST_PICK)
+        } catch (error: Exception) {
+            pendingPick = null
+            result.error("PICK", error.message, null)
+        }
+    }
+
+    @Deprecated("Uses the platform activity result callback")
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_PICK) return
+        val result = pendingPick ?: return
+        pendingPick = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            result.success(null)
+            return
+        }
+        worker.execute {
+            try {
+                val (path, width, height) = PhotoTools.importPicked(applicationContext, uri)
+                runOnUiThread {
+                    result.success(mapOf("path" to path, "width" to width, "height" to height))
+                }
+            } catch (error: Exception) {
+                runOnUiThread { result.error("PICK", error.message, null) }
+            }
+        }
+    }
+
+    private fun hasLocationPermission() =
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    private fun requestLocation(result: MethodChannel.Result) {
+        if (hasLocationPermission()) {
+            result.success(lastLocation())
+            return
+        }
+        if (pendingLocation != null) {
+            result.success(null)
+            return
+        }
+        pendingLocation = result
+        requestPermissions(
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            REQUEST_LOCATION
+        )
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_LOCATION) return
+        val result = pendingLocation ?: return
+        pendingLocation = null
+        result.success(if (hasLocationPermission()) lastLocation() else null)
+    }
+
+    // The newest last-known fix from any enabled provider; no waiting for a new fix.
+    private fun lastLocation(): Map<String, Any>? = try {
+        val manager = getSystemService(LOCATION_SERVICE) as LocationManager
+        manager.getProviders(true)
+            .mapNotNull { manager.getLastKnownLocation(it) }
+            .maxByOrNull { it.time }
+            ?.let {
+                mapOf(
+                    "latitude" to it.latitude,
+                    "longitude" to it.longitude,
+                    "accuracy" to it.accuracy.toDouble(),
+                    "time" to it.time,
+                )
+            }
+    } catch (_: SecurityException) {
+        null
     }
 
     // A fine-tuned RF-DETR model bundled as custom_model.tflite replaces the COCO detector.
@@ -541,6 +731,7 @@ class MainActivity : FlutterActivity() {
         worker.execute {
             detector?.close()
             customDetector?.close()
+            keptFrame?.recycle()
             embedder?.close()
         }
         worker.shutdown()

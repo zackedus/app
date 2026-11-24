@@ -21,7 +21,7 @@ curl --fail --silent --show-error --location --retry 3 \
   https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_small/float32/1/mobilenet_v3_small.tflite \
   --output "$embedder"
 printf '%s  %s\n' bbbb4c51a55a53905af1daec995ca1aae355046f8839bb8c9f5ce9271394bc40 "$embedder" | sha256sum --check
-cp native/MainActivity.kt native/RfDetrDetector.kt "$app/src/main/kotlin/id/rancangpro/object_detection/"
+cp native/*.kt "$app/src/main/kotlin/id/rancangpro/object_detection/"
 # Optional fine-tuned RF-DETR model (see training/README.md).
 if [[ -f native/custom_model.tflite ]]; then
   test -f native/custom_model.tflite.rfdetr.json ||
@@ -41,6 +41,8 @@ xml = xml.replace(
     "    <application",
     '    <uses-permission android:name="android.permission.INTERNET" />\n'
     '    <uses-permission android:name="android.permission.CAMERA" />\n'
+    '    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />\n'
+    '    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />\n'
     '    <uses-feature android:name="android.hardware.camera" android:required="true" />\n'
     '    <application',
     1,
