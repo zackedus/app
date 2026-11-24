@@ -27,6 +27,12 @@ Untuk membuat APK pengujian, jalankan `flutter build apk --debug` di folder `obj
 - Kelas kustom aktif setelah minimal 3 foto beranotasi. Vektor fitur disimpan di samping foto (`.vec.json`) sehingga hanya foto baru atau yang diubah yang diproses ulang.
 - **Galeri dataset**: hapus foto atau kelas, dan ekspor ZIP berisi `images/`, `labels/` (YOLO), `data.yaml`, dan `annotations_coco.json` (COCO). File tersimpan di `Download/DeteksiObjek/` (Android 10+) untuk fine-tuning RF-DETR/YOLO.
 
+## Detektor sendiri (RF-DETR)
+
+Lihat `training/README.md`: ekspor dataset dari aplikasi, latih RF-DETR Nano di Colab (`training/train_rfdetr.ipynb`), lalu taruh `custom_model.tflite` dan `custom_model.tflite.rfdetr.json` di `native/`. Jika file itu ada, aplikasi memakainya sebagai pengganti EfficientDet.
+
+Kamera memakai implementasi CameraX (`camera_android_camerax`).
+
 ## Google Play 16 KB
 
 Detektor memakai MediaPipe Tasks (`tasks-vision` 0.10.33) yang library native-nya mendukung halaman 16 KB. Workflow CI menjalankan `scripts/check_16kb.py` pada APK dan gagal jika ada `.so` arm64 yang belum selaras 16 KB.

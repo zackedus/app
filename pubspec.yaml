@@ -9,7 +9,8 @@ dependencies:
     sdk: flutter
   path_provider: ^2.1.5
   camera: ^0.11.3
-  camera_android: ^0.10.10
+  # CameraX implementation; 0.6.23+5 fixes NV21 streaming. 0.7.x needs a newer Flutter.
+  camera_android_camerax: ^0.6.23+5
 dev_dependencies:
   flutter_test:
     sdk: flutter

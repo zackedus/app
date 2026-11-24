@@ -41,3 +41,34 @@ jobs:
           name: deteksi-objek-android-arm64
           path: object_detection/build/app/outputs/flutter-apk/app-debug.apk
           if-no-files-found: error
+
+  # Puts the APK on the Releases page so it can be downloaded on a phone
+  # without unzipping. Runs in its own job so only this job can write.
+  publish:
+    needs: android
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: apk-release-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: deteksi-objek-android-arm64
+      - name: Publish APK to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          safe="$(printf '%s' "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')"
+          short="${GITHUB_SHA::7}"
+          tag="apk-$safe"
+          apk="deteksi-objek-$safe-$short.apk"
+          mv app-debug.apk "$apk"
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" "$apk" --repo "$GITHUB_REPOSITORY" --prerelease \
+            --target "$GITHUB_SHA" --title "APK debug $BRANCH ($short)" \
+            --notes "APK debug ARM64 otomatis dari branch \`$BRANCH\`, commit $GITHUB_SHA. Rilis ini diganti setiap ada push baru ke branch yang sama."
