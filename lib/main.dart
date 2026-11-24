@@ -89,6 +89,33 @@ class _DetectionScreenState extends State<DetectionScreen>
   List<_Detection> _detections = [];
   Map<String, List<List<List<double>>>> _examples = {};
   int _learningRevision = 0;
+  bool _focusMode = false;
+  String? _focusLabel;
+  int _focusFrames = 0;
+
+  void _toggleFocus() {
+    setState(() {
+      _focusMode = !_focusMode;
+      _focusLabel = null;
+      _focusFrames = 0;
+      _detections = [];
+    });
+  }
+
+  List<_Detection> _confirmedFocus(List<_Detection> candidates) {
+    final candidate = candidates.isEmpty ? null : candidates.first;
+    if (candidate == null || !candidate.local) {
+      _focusLabel = null;
+      _focusFrames = 0;
+      return [];
+    }
+    if (_focusLabel != candidate.label) {
+      _focusLabel = candidate.label;
+      _focusFrames = 0;
+    }
+    _focusFrames++;
+    return _focusFrames >= 3 ? [candidate] : [];
+  }
 
   Future<void> _learnApprovedExamples() async {
     final revision = ++_learningRevision;
@@ -129,6 +156,11 @@ class _DetectionScreenState extends State<DetectionScreen>
       if (!mounted || revision != _learningRevision) return;
       setState(() {
         _examples = Map.fromEntries(examples.entries.where((e) => e.value.length >= 3));
+        if (_examples.isEmpty) {
+          _focusMode = false;
+          _focusLabel = null;
+          _focusFrames = 0;
+        }
       });
     } catch (_) {
       // The built-in detector remains available when dataset storage is unavailable.
@@ -208,6 +240,8 @@ class _DetectionScreenState extends State<DetectionScreen>
       if (mounted) {
         setState(() {
           _detections = [];
+          _focusLabel = null;
+          _focusFrames = 0;
           _error = null;
         });
       }
@@ -254,6 +288,7 @@ class _DetectionScreenState extends State<DetectionScreen>
   ) async {
     if (_busy || _error != null || !_current(generation)) return;
     _busy = true;
+    final focus = _focusMode;
     try {
       if (image.planes.length != 1 ||
           image.planes.single.bytes.length !=
@@ -266,15 +301,17 @@ class _DetectionScreenState extends State<DetectionScreen>
             'width': image.width,
             'height': image.height,
             'rotation': camera.description.sensorOrientation,
+            'focus': focus,
           });
-      if (_current(generation)) {
+      if (_current(generation) && focus == _focusMode) {
         setState(() {
-          _detections = (result ?? [])
+          final candidates = (result ?? [])
               .map(_Detection.fromMap)
               .map(_matchLocal)
               .where((detection) => detection.local || detection.score >= 0.5)
               .take(8)
               .toList();
+          _detections = focus ? _confirmedFocus(candidates) : candidates;
         });
       }
     } catch (error) {
@@ -531,7 +568,7 @@ class _DetectionScreenState extends State<DetectionScreen>
                       child: CameraPreview(
                         camera,
                         child: ClipRect(
-                          child: CustomPaint(painter: _Overlay(_detections)),
+                          child: CustomPaint(painter: _Overlay(_detections, focus: _focusMode)),
                         ),
                       ),
                     ),
@@ -540,7 +577,7 @@ class _DetectionScreenState extends State<DetectionScreen>
                     padding: const EdgeInsets.all(16),
                     child: Text(
                       _detections.isEmpty
-                          ? 'Arahkan kamera ke objek'
+                          ? (_focusMode ? 'Penuhi bingkai dengan objek. Belum cocok.' : 'Arahkan kamera ke objek')
                           : '${_detections.length} objek terdeteksi',
                       style: const TextStyle(color: Colors.white),
                     ),
@@ -549,6 +586,13 @@ class _DetectionScreenState extends State<DetectionScreen>
                     Text(
                       '${_examples.length} kelas contoh aktif',
                       style: const TextStyle(color: Colors.white70),
+                    ),
+                  if (_examples.isNotEmpty)
+                    TextButton.icon(
+                      onPressed: _collecting ? null : _toggleFocus,
+                      icon: const Icon(Icons.center_focus_strong),
+                      label: Text(_focusMode ? 'Kembali ke deteksi umum' : 'Kenali objek di tengah'),
+                      style: TextButton.styleFrom(foregroundColor: Colors.white),
                     ),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
@@ -1119,7 +1163,9 @@ class _Detection {
 }
 
 class _Overlay extends CustomPainter {
-  const _Overlay(this.detections);
+  const _Overlay(this.detections, {this.focus = false});
+
+  final bool focus;
 
   final List<_Detection> detections;
   static const _accent = Color(0xff79ebbb);
@@ -1135,6 +1181,15 @@ class _Overlay extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    if (focus && detections.isEmpty) {
+      canvas.drawRect(
+        Rect.fromLTRB(size.width * .2, size.height * .3, size.width * .8, size.height * .7),
+        Paint()
+          ..color = Colors.white70
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2,
+      );
+    }
     if (size.isEmpty) return;
     final border = Paint()
       ..color = _accent
@@ -1174,5 +1229,5 @@ class _Overlay extends CustomPainter {
 
   @override
   bool shouldRepaint(_Overlay oldDelegate) =>
-      detections != oldDelegate.detections;
+      detections != oldDelegate.detections || focus != oldDelegate.focus;
 }
