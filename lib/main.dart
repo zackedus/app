@@ -59,12 +59,88 @@ class _DetectionScreenState extends State<DetectionScreen>
   int _generation = 0;
   String? _error;
   List<_Detection> _detections = [];
+  Map<String, List<List<double>>> _examples = {};
+  int _learningRevision = 0;
+
+  Future<void> _learnApprovedExamples() async {
+    final revision = ++_learningRevision;
+    final examples = <String, List<List<double>>>{};
+    try {
+      final root = await getApplicationDocumentsDirectory();
+      final dataset = Directory('${root.path}/training_examples');
+      if (await dataset.exists()) {
+        await for (final entry in dataset.list(recursive: true, followLinks: false)) {
+          if (!mounted || revision != _learningRevision) return;
+          if (entry is! File || !entry.path.endsWith('.jpg.json')) continue;
+          try {
+            final json = await entry.readAsString();
+            final boxes = _parseBoxes(json);
+            if (boxes.isEmpty) continue;
+            final label = entry.parent.uri.pathSegments.lastWhere(
+              (segment) => segment.isNotEmpty,
+            );
+            final samples = await _detector.invokeListMethod<List<Object?>>(
+              'learnPhoto',
+              {
+                'path': entry.path.substring(0, entry.path.length - 5),
+                'boxes': boxes.map((box) =>
+                    [box.left, box.top, box.right, box.bottom]).toList(),
+              },
+            );
+            if (samples == null || samples.isEmpty) continue;
+            // One prototype per photo so duplicate boxes do not qualify a class.
+            final sample = samples.first.cast<num>().map((v) => v.toDouble()).toList();
+            if (sample.length == 48) (examples[label] ??= []).add(sample);
+          } catch (_) {
+            // A damaged photo or annotation does not block other examples.
+          }
+        }
+      }
+      if (!mounted || revision != _learningRevision) return;
+      setState(() {
+        _examples = Map.fromEntries(examples.entries.where((e) => e.value.length >= 3));
+      });
+    } catch (_) {
+      // The built-in detector remains available when dataset storage is unavailable.
+    }
+  }
+
+  _Detection _matchLocal(_Detection detection) {
+    final appearance = detection.appearance;
+    if (appearance.length != 48 || _examples.isEmpty) return detection;
+    String? bestLabel;
+    var best = double.infinity;
+    var runnerUp = double.infinity;
+    for (final entry in _examples.entries) {
+      final distances = entry.value.map((reference) {
+        var sum = 0.0;
+        for (var i = 0; i < appearance.length; i++) {
+          final difference = appearance[i] - reference[i];
+          sum += difference * difference;
+        }
+        return sum / appearance.length;
+      }).toList()..sort();
+      final distance = (distances[0] + distances[1]) / 2;
+      if (distance < best) {
+        runnerUp = best;
+        best = distance;
+        bestLabel = entry.key;
+      } else if (distance < runnerUp) {
+        runnerUp = distance;
+      }
+    }
+    if (bestLabel == null || best > 0.012 || runnerUp - best < 0.004) {
+      return detection;
+    }
+    return _Detection(detection.box, bestLabel, detection.score, appearance, local: true);
+  }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _scheduleCamera();
+    _learnApprovedExamples();
   }
 
   @override
@@ -151,7 +227,7 @@ class _DetectionScreenState extends State<DetectionScreen>
           });
       if (_current(generation)) {
         setState(() {
-          _detections = (result ?? []).map(_Detection.fromMap).toList();
+          _detections = (result ?? []).map(_Detection.fromMap).map(_matchLocal).toList();
         });
       }
     } catch (error) {
@@ -278,6 +354,7 @@ class _DetectionScreenState extends State<DetectionScreen>
       final reviewed = await _openEditor(context, photo, label, boxes);
       if (reviewed == null) return 'Foto tersimpan tanpa anotasi.';
       await _saveAnnotation(photo, label, reviewed);
+      await _learnApprovedExamples();
       return 'Foto dan ${reviewed.length} anotasi tersimpan di HP.';
     } on _OpenRouterException catch (error) {
       if (error.status == 401 || error.status == 403) {
@@ -369,9 +446,12 @@ class _DetectionScreenState extends State<DetectionScreen>
           ),
           IconButton(
             tooltip: 'Galeri dataset',
-            onPressed: _collecting ? null : () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const _DatasetGallery()),
-            ),
+            onPressed: _collecting ? null : () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const _DatasetGallery()),
+              );
+              if (mounted) await _learnApprovedExamples();
+            },
             icon: const Icon(Icons.photo_library_outlined),
           ),
         ],
@@ -417,6 +497,11 @@ class _DetectionScreenState extends State<DetectionScreen>
                       style: const TextStyle(color: Colors.white),
                     ),
                   ),
+                  if (_examples.isNotEmpty)
+                    Text(
+                      '${_examples.length} kelas contoh aktif',
+                      style: const TextStyle(color: Colors.white70),
+                    ),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
                     child: Column(
@@ -958,7 +1043,7 @@ class _ExampleLabelDialogState extends State<_ExampleLabelDialog> {
 }
 
 class _Detection {
-  const _Detection(this.box, this.label, this.score);
+  const _Detection(this.box, this.label, this.score, this.appearance, {this.local = false});
 
   factory _Detection.fromMap(Map<Object?, Object?> map) {
     double number(String key) => (map[key] as num).toDouble();
@@ -971,12 +1056,18 @@ class _Detection {
       ),
       map['label'] as String,
       number('score'),
+      ((map['appearance'] as List?) ?? const [])
+          .cast<num>()
+          .map((value) => value.toDouble())
+          .toList(),
     );
   }
 
   final Rect box;
   final String label;
   final double score;
+  final List<double> appearance;
+  final bool local;
 }
 
 class _Overlay extends CustomPainter {
@@ -1015,7 +1106,7 @@ class _Overlay extends CustomPainter {
       final label = _labels[detection.label] ?? detection.label;
       final text = TextPainter(
         text: TextSpan(
-          text: '$label ${(100 * detection.score).round()}%',
+          text: detection.local ? '$label · contoh' : '$label ${(100 * detection.score).round()}%',
           style: const TextStyle(color: Colors.black, fontSize: 13),
         ),
         maxLines: 1,
