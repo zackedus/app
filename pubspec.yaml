@@ -1,0 +1,16 @@
+name: object_detection
+description: Deteksi objek dari kamera Android.
+publish_to: none
+version: 0.1.0+1
+environment:
+  sdk: ^3.9.0
+dependencies:
+  flutter:
+    sdk: flutter
+  camera: ^0.11.3
+  camera_android: ^0.10.10
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  uses-material-design: true
