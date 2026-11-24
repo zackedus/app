@@ -16,6 +16,11 @@ rm "$project/analysis_options.yaml"
 app="$project/android/app"
 mkdir -p "$app/src/main/assets"
 cp native/model.tflite "$app/src/main/assets/model.tflite"
+embedder="$app/src/main/assets/mobilenet_v3_small.tflite"
+curl --fail --silent --show-error --location --retry 3 \
+  https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_small/float32/1/mobilenet_v3_small.tflite \
+  --output "$embedder"
+printf '%s  %s\n' bbbb4c51a55a53905af1daec995ca1aae355046f8839bb8c9f5ce9271394bc40 "$embedder" | sha256sum --check
 cp native/MainActivity.kt "$app/src/main/kotlin/id/rancangpro/object_detection/MainActivity.kt"
 
 python3 - "$app" <<'PY'
@@ -43,7 +48,7 @@ source = gradle.read_text()
 assert "android {" in source and "minSdk = flutter.minSdkVersion" in source
 source = source.replace("android {", 'android {\n    androidResources {\n        noCompress += "tflite"\n    }\n', 1)
 source = source.replace("minSdk = flutter.minSdkVersion", "minSdk = maxOf(flutter.minSdkVersion, 24)", 1)
-source += '\ndependencies {\n    implementation("org.tensorflow:tensorflow-lite-task-vision:0.4.4")\n    implementation("com.google.auto.value:auto-value-annotations:1.11.0")\n}\n'
+source += '\ndependencies {\n    implementation("org.tensorflow:tensorflow-lite-task-vision:0.4.4")\n    implementation("com.google.mediapipe:tasks-vision:0.10.21")\n    implementation("com.google.auto.value:auto-value-annotations:1.11.0")\n}\n'
 if os.environ.get("ANDROID_RELEASE") == "1":
     base_id = 'applicationId = "id.rancangpro.object_detection"'
     debug_signing = 'signingConfig = signingConfigs.getByName("debug")'
