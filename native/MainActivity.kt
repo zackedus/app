@@ -1,6 +1,11 @@
 package id.rancangpro.object_detection
 
 import android.graphics.Bitmap
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.imageembedder.ImageEmbedder
+import kotlin.math.ceil
+import kotlin.math.floor
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -31,6 +36,8 @@ import java.util.concurrent.Executors
 class MainActivity : FlutterActivity() {
     private val worker = Executors.newSingleThreadExecutor()
     private var detector: ObjectDetector? = null
+    private var embedder: ImageEmbedder? = null
+    private var embeddingUnavailable = false
     private var channel: MethodChannel? = null
     private var settingsChannel: MethodChannel? = null
 
@@ -137,6 +144,7 @@ class MainActivity : FlutterActivity() {
         val height = requireNotNull(call.argument<Int>("height"))
         val rotation = requireNotNull(call.argument<Int>("rotation"))
         val focus = call.argument<Boolean>("focus") == true
+        val compareExamples = call.argument<Boolean>("compareExamples") == true
         val model = detector ?: ObjectDetector.createFromFileAndOptions(
             applicationContext,
             "model.tflite",
@@ -162,12 +170,15 @@ class MainActivity : FlutterActivity() {
                         upright.width * .2f, upright.height * .3f,
                         upright.width * .8f, upright.height * .7f
                     )
-                    return listOf(candidate(upright, box, "", 0.0))
+                    return listOf(candidate(upright, box, "", 0.0, true))
                 }
-                return model.detect(TensorImage.fromBitmap(upright)).mapNotNull { detection ->
+                return model.detect(TensorImage.fromBitmap(upright)).mapIndexedNotNull { index, detection ->
                     val category = detection.categories.maxByOrNull { it.score }
-                        ?: return@mapNotNull null
-                    candidate(upright, detection.boundingBox, category.label, category.score.toDouble())
+                        ?: return@mapIndexedNotNull null
+                    candidate(
+                        upright, detection.boundingBox, category.label,
+                        category.score.toDouble(), compareExamples && index < 4
+                    )
                 }
             } finally {
                 if (upright !== bitmap) upright.recycle()
@@ -178,10 +189,10 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun candidate(
-        bitmap: Bitmap, box: RectF, label: String, score: Double
+        bitmap: Bitmap, box: RectF, label: String, score: Double, useEmbedding: Boolean
     ): Map<String, Any> = mapOf(
         "label" to label,
-        "appearance" to appearance(bitmap, box),
+        "appearance" to appearance(bitmap, box, useEmbedding),
         "score" to score,
         "left" to box.left.toDouble() / bitmap.width,
         "top" to box.top.toDouble() / bitmap.height,
@@ -209,14 +220,14 @@ class MainActivity : FlutterActivity() {
                     box[1].toFloat() * photo.height,
                     box[2].toFloat() * photo.width,
                     box[3].toFloat() * photo.height
-                ))
+                ), true)
             }
         } finally {
             photo.recycle()
         }
     }
 
-    private fun appearance(bitmap: Bitmap, box: RectF): List<Double> {
+    private fun appearance(bitmap: Bitmap, box: RectF, useEmbedding: Boolean): List<Double> {
         val size = 24
         val luminance = DoubleArray(size * size)
         val colors = DoubleArray(24)
@@ -268,7 +279,8 @@ class MainActivity : FlutterActivity() {
         }
         val edgeSum = edges.sum().coerceAtLeast(1.0)
         val colorSum = colors.sum().coerceAtLeast(1.0)
-        return edges.map { it / edgeSum } + colors.map { it / colorSum }
+        val basic = edges.map { it / edgeSum } + colors.map { it / colorSum }
+        return if (useEmbedding) basic + imageEmbedding(bitmap, box) else basic
     }
 
     private fun addColorVote(histogram: DoubleArray, offset: Int, value: Double) {
@@ -279,10 +291,54 @@ class MainActivity : FlutterActivity() {
         histogram[offset + (bin + 1).coerceAtMost(7)] += fraction
     }
 
+    private fun imageEmbedding(bitmap: Bitmap, box: RectF): List<Double> {
+        if (embeddingUnavailable) return emptyList()
+        val left = floor(box.left).toInt().coerceIn(0, bitmap.width - 1)
+        val top = floor(box.top).toInt().coerceIn(0, bitmap.height - 1)
+        val right = ceil(box.right).toInt().coerceIn(left + 1, bitmap.width)
+        val bottom = ceil(box.bottom).toInt().coerceIn(top + 1, bitmap.height)
+        if (right - left < 8 || bottom - top < 8) return emptyList()
+        val model = embedder ?: try {
+            ImageEmbedder.createFromOptions(
+                applicationContext,
+                ImageEmbedder.ImageEmbedderOptions.builder()
+                    .setBaseOptions(BaseOptions.builder()
+                        .setModelAssetPath("mobilenet_v3_small.tflite")
+                        .build())
+                    .setL2Normalize(true)
+                    .setQuantize(false)
+                    .build()
+            ).also { embedder = it }
+        } catch (_: Exception) {
+            embeddingUnavailable = true
+            return emptyList()
+        } catch (_: LinkageError) {
+            embeddingUnavailable = true
+            return emptyList()
+        }
+        val crop = Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+        try {
+            val input = BitmapImageBuilder(crop).build()
+            try {
+                return model.embed(input).embeddingResult().embeddings()
+                    .firstOrNull()?.floatEmbedding()?.map { it.toDouble() } ?: emptyList()
+            } finally {
+                input.close()
+            }
+        } catch (_: Exception) {
+            return emptyList()
+        } finally {
+            if (crop !== bitmap) crop.recycle()
+        }
+    }
+
     override fun onDestroy() {
         channel?.setMethodCallHandler(null)
         settingsChannel?.setMethodCallHandler(null)
-        worker.execute { detector?.close() }
+        worker.execute {
+            detector?.close()
+            embedder?.close()
+        }
         worker.shutdown()
         super.onDestroy()
     }
