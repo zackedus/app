@@ -8,15 +8,19 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'src/annotations.dart';
+import 'src/detection_settings.dart';
 import 'src/labels.dart';
 import 'src/match_worker.dart';
 import 'src/matching.dart';
+import 'src/tracker.dart';
 
 part 'src/ui/dataset_gallery.dart';
 part 'src/ui/annotation_editor.dart';
 part 'src/ui/openrouter.dart';
 part 'src/ui/example_label_dialog.dart';
 part 'src/ui/overlay.dart';
+part 'src/ui/detection_settings_page.dart';
+part 'src/ui/photo_detection_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -112,6 +116,184 @@ class _DetectionScreenState extends State<DetectionScreen>
   String? _focusLabel;
   int _focusFrames = 0;
   bool _focusMissedOnce = false;
+  DetectionSettings _detectionSettings = const DetectionSettings();
+  final _tracker = ObjectTracker();
+  bool _counting = false;
+  bool _snapshotRequested = false;
+  bool _savingSnapshot = false;
+  String _snapshotLocation = '';
+  DateTime? _lastFrameAt;
+  List<String> _detectorClasses = const [];
+
+  Future<File> _settingsFile() async =>
+      File('${(await getApplicationDocumentsDirectory()).path}/detection_settings.json');
+
+  Future<void> _loadDetectionSettings() async {
+    try {
+      final file = await _settingsFile();
+      if (!await file.exists()) return;
+      final settings = DetectionSettings.fromJson(jsonDecode(await file.readAsString()));
+      if (mounted) setState(() => _detectionSettings = settings);
+    } catch (_) {
+      // Defaults are used when settings cannot be read.
+    }
+  }
+
+  Future<void> _openDetectionSettings() async {
+    final classes = {
+      ..._detectorClasses.isEmpty ? cocoLabelsId.keys : _detectorClasses,
+      ..._examples.keys,
+    }.toList();
+    final updated = await Navigator.of(context).push<DetectionSettings>(
+      MaterialPageRoute(
+        builder: (_) => _DetectionSettingsPage(_detectionSettings, classes),
+      ),
+    );
+    if (!mounted || updated == null || updated == _detectionSettings) return;
+    setState(() => _detectionSettings = updated);
+    try {
+      final file = await _settingsFile();
+      final pending = File('${file.path}.tmp');
+      await pending.writeAsString(jsonEncode(updated.toJson()), flush: true);
+      await pending.rename(file.path);
+    } catch (_) {
+      if (mounted) _showMessage('Pengaturan berlaku, tapi gagal disimpan permanen.');
+    }
+  }
+
+  void _showMessage(String message, {SnackBarAction? action}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), action: action),
+    );
+  }
+
+  void _toggleCounting() {
+    setState(() {
+      _counting = !_counting;
+      _tracker.reset();
+    });
+  }
+
+  /// Last known position as a caption line, or '' when unavailable or off.
+  Future<String> _locationLine() async {
+    if (!_detectionSettings.includeLocation) return '';
+    try {
+      final location = await _detector.invokeMapMethod<String, Object?>('location');
+      if (location == null) return '';
+      final latitude = (location['latitude'] as num).toDouble();
+      final longitude = (location['longitude'] as num).toDouble();
+      final accuracy = (location['accuracy'] as num).round();
+      final time = DateTime.fromMillisecondsSinceEpoch((location['time'] as num).toInt());
+      return 'Lokasi: ${latitude.toStringAsFixed(6)}, ${longitude.toStringAsFixed(6)} '
+          '(±$accuracy m, ${formatTimestamp(time)})';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  String _countsLine(Map<String, int> counts) => counts.entries
+      .map((entry) => '${displayLabel(entry.key)} ${entry.value}')
+      .join(', ');
+
+  /// Text under a saved photo: time, place, what was found and the model.
+  String _snapshotCaption(
+    List<_Detection> detections,
+    String location, {
+    required bool fromCamera,
+  }) {
+    final perLabel = <String, int>{};
+    for (final detection in detections) {
+      perLabel[detection.label] = (perLabel[detection.label] ?? 0) + 1;
+    }
+    return [
+      'Deteksi Objek · ${formatTimestamp(DateTime.now())}',
+      if (location.isNotEmpty) location,
+      perLabel.isEmpty
+          ? 'Tidak ada objek terdeteksi'
+          : '${detections.length} objek: ${_countsLine(perLabel)}',
+      if (fromCamera && _counting && _tracker.totals.isNotEmpty)
+        'Total terhitung: ${_countsLine(_tracker.totals)}',
+      if (_detectorName != null) 'Model: $_detectorName',
+    ].join('\n');
+  }
+
+  Future<void> _requestSnapshot() async {
+    if (_savingSnapshot) return;
+    setState(() => _savingSnapshot = true);
+    // The location is fetched first so saving does not hold up a camera frame.
+    _snapshotLocation = await _locationLine();
+    if (!mounted) return;
+    _snapshotRequested = true;
+    // If no frame arrives (camera stopped), give the button back.
+    Future<void>.delayed(const Duration(seconds: 5), () {
+      if (mounted && _snapshotRequested) {
+        setState(() {
+          _snapshotRequested = false;
+          _savingSnapshot = false;
+        });
+        _showMessage('Foto gagal disimpan: kamera tidak mengirim gambar.');
+      }
+    });
+  }
+
+  Future<void> _saveSnapshot(List<_Detection> detections, {String? photoPath}) async {
+    try {
+      final saved = await _detector.invokeMapMethod<String, Object?>('saveSnapshot', {
+        if (photoPath != null) 'path': photoPath,
+        'boxes': [
+          for (final d in detections) [d.box.left, d.box.top, d.box.right, d.box.bottom],
+        ],
+        'labels': [
+          for (final d in detections) d.caption(showTrack: _counting && photoPath == null),
+        ],
+        'caption': _snapshotCaption(
+          detections,
+          _snapshotLocation,
+          fromCamera: photoPath == null,
+        ),
+      });
+      final uri = saved?['uri'] as String? ?? '';
+      _showMessage(
+        'Foto tersimpan di ${saved?['location']}',
+        action: uri.isEmpty
+            ? null
+            : SnackBarAction(
+                label: 'Bagikan',
+                onPressed: () => _detector.invokeMethod<void>('share', {'uri': uri}),
+              ),
+      );
+    } catch (_) {
+      _showMessage('Foto gagal disimpan. Coba lagi.');
+    }
+  }
+
+  Future<void> _openPhotoDetection() async {
+    Map<String, Object?>? picked;
+    try {
+      picked = await _detector.invokeMapMethod<String, Object?>('pickPhoto');
+    } catch (_) {
+      _showMessage('Foto tidak bisa dibuka.');
+      return;
+    }
+    if (!mounted || picked == null) return;
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => _PhotoDetectionPage(
+          path: picked!['path'] as String,
+          width: (picked['width'] as num).toDouble(),
+          height: (picked['height'] as num).toDouble(),
+          settings: _detectionSettings,
+          examples: _examples,
+          saveSnapshot: (detections, path) async {
+            _snapshotLocation = await _locationLine();
+            await _saveSnapshot(detections, photoPath: path);
+          },
+        ),
+      ),
+    );
+    if (mounted && changed == true) await _learnApprovedExamples();
+  }
 
   void _toggleFocus() {
     setState(() {
@@ -120,6 +302,7 @@ class _DetectionScreenState extends State<DetectionScreen>
       _focusFrames = 0;
       _focusMissedOnce = false;
       _detections = [];
+      _tracker.reset();
     });
   }
 
@@ -244,6 +427,7 @@ class _DetectionScreenState extends State<DetectionScreen>
     _scheduleCamera();
     _learnApprovedExamples();
     _loadDetectorInfo();
+    _loadDetectionSettings();
   }
 
   String? _detectorName;
@@ -252,7 +436,10 @@ class _DetectionScreenState extends State<DetectionScreen>
     try {
       final info = await _detector.invokeMapMethod<String, Object?>('detectorInfo');
       if (!mounted || info == null) return;
-      setState(() => _detectorName = info['name'] as String?);
+      setState(() {
+        _detectorName = info['name'] as String?;
+        _detectorClasses = (info['classes'] as List?)?.whereType<String>().toList() ?? const [];
+      });
     } on PlatformException {
       // The status line is optional.
     } on MissingPluginException {
@@ -330,8 +517,16 @@ class _DetectionScreenState extends State<DetectionScreen>
     int generation,
   ) async {
     if (_busy || _error != null || !_current(generation)) return;
+    final gap = _detectionSettings.minFrameGap;
+    final now = DateTime.now();
+    final last = _lastFrameAt;
+    // A snapshot request is served right away, whatever the frame limit.
+    if (gap != null && last != null && now.difference(last) < gap && !_snapshotRequested) return;
+    _lastFrameAt = now;
     _busy = true;
     final focus = _focusMode;
+    final keepFrame = _snapshotRequested;
+    _snapshotRequested = false;
     try {
       if (image.planes.length != 1 ||
           image.planes.single.bytes.length !=
@@ -346,6 +541,7 @@ class _DetectionScreenState extends State<DetectionScreen>
             'rotation': camera.description.sensorOrientation,
             'focus': focus,
             'compareExamples': _examples.isNotEmpty,
+            'keepFrame': keepFrame,
           });
       final raw = (result ?? []).map(_Detection.fromMap).toList();
       // Comparison with example photos runs on a background isolate.
@@ -355,18 +551,22 @@ class _DetectionScreenState extends State<DetectionScreen>
       );
       if (_current(generation) && focus == _focusMode) {
         setState(() {
-          final candidates = [
-            for (var i = 0; i < raw.length; i++)
-              if (i < labels.length && labels[i] != null)
-                raw[i].asLocal(labels[i]!)
-              else
-                raw[i],
-          ].where((detection) => detection.local || detection.score >= 0.5).take(8).toList();
-          _detections = focus ? _confirmedFocus(candidates) : candidates;
+          final candidates = _visibleDetections(raw, labels, _detectionSettings);
+          final shown = focus ? _confirmedFocus(candidates) : candidates;
+          final ids = _tracker.update([for (final d in shown) (d.label, d.box)]);
+          _detections = [for (var i = 0; i < shown.length; i++) shown[i].withTrack(ids[i])];
         });
       }
       _frameFailures.succeed();
+      if (keepFrame) {
+        await _saveSnapshot(_detections);
+        if (mounted) setState(() => _savingSnapshot = false);
+      }
     } catch (error) {
+      if (keepFrame && mounted) {
+        setState(() => _savingSnapshot = false);
+        _showMessage('Foto gagal disimpan. Coba lagi.');
+      }
       // A single bad frame is skipped; only repeated failures stop the camera.
       if (_frameFailures.fail() && _current(generation)) {
         _frameFailures.succeed();
@@ -514,6 +714,45 @@ class _DetectionScreenState extends State<DetectionScreen>
     super.dispose();
   }
 
+  Widget _countPanel() {
+    final totals = _tracker.totals;
+    final visible = _tracker.visible;
+    final labels = {...totals.keys, ...visible.keys}.toList()..sort();
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Column(
+        children: [
+          if (labels.isEmpty)
+            const Text(
+              'Objek dihitung setelah terlihat 3 frame berturut-turut.',
+              style: TextStyle(color: Colors.white70),
+              textAlign: TextAlign.center,
+            )
+          else
+            Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 6,
+              runSpacing: 4,
+              children: [
+                for (final label in labels)
+                  Chip(
+                    label: Text(
+                      '${displayLabel(label)}: ${visible[label] ?? 0} terlihat · '
+                      'total ${totals[label] ?? 0}',
+                    ),
+                  ),
+              ],
+            ),
+          TextButton(
+            onPressed: () => setState(_tracker.reset),
+            style: TextButton.styleFrom(foregroundColor: Colors.white70),
+            child: const Text('Reset hitungan'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final camera = _camera;
@@ -526,11 +765,6 @@ class _DetectionScreenState extends State<DetectionScreen>
         title: const Text('Deteksi Objek'),
         actions: [
           IconButton(
-            tooltip: 'Pengaturan OpenRouter',
-            onPressed: _collecting ? null : _openRouterSettings,
-            icon: const Icon(Icons.settings_outlined),
-          ),
-          IconButton(
             tooltip: 'Galeri dataset',
             onPressed: _collecting ? null : () async {
               await Navigator.of(context).push(
@@ -539,6 +773,43 @@ class _DetectionScreenState extends State<DetectionScreen>
               if (mounted) await _learnApprovedExamples();
             },
             icon: const Icon(Icons.photo_library_outlined),
+          ),
+          PopupMenuButton<String>(
+            tooltip: 'Menu',
+            enabled: !_collecting,
+            onSelected: (choice) {
+              switch (choice) {
+                case 'photo':
+                  _openPhotoDetection();
+                case 'settings':
+                  _openDetectionSettings();
+                case 'openrouter':
+                  _openRouterSettings();
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'photo',
+                child: ListTile(
+                  leading: Icon(Icons.image_search),
+                  title: Text('Deteksi dari foto'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'settings',
+                child: ListTile(
+                  leading: Icon(Icons.tune),
+                  title: Text('Pengaturan deteksi'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'openrouter',
+                child: ListTile(
+                  leading: Icon(Icons.settings_outlined),
+                  title: Text('Pengaturan OpenRouter'),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -569,7 +840,13 @@ class _DetectionScreenState extends State<DetectionScreen>
                       child: CameraPreview(
                         camera,
                         child: ClipRect(
-                          child: CustomPaint(painter: _Overlay(_detections, focus: _focusMode)),
+                          child: CustomPaint(
+                            painter: _Overlay(
+                              _detections,
+                              focus: _focusMode,
+                              showTracks: _counting,
+                            ),
+                          ),
                         ),
                       ),
                     ),
@@ -581,6 +858,28 @@ class _DetectionScreenState extends State<DetectionScreen>
                           ? (_focusMode ? 'Penuhi bingkai dengan objek. Belum cocok.' : 'Arahkan kamera ke objek')
                           : '${_detections.length} objek terdeteksi',
                       style: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+                  if (_counting) _countPanel(),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 4,
+                      children: [
+                        TextButton.icon(
+                          onPressed: _collecting ? null : _toggleCounting,
+                          icon: Icon(_counting ? Icons.stop_circle_outlined : Icons.tag),
+                          label: Text(_counting ? 'Selesai hitung' : 'Hitung objek'),
+                          style: TextButton.styleFrom(foregroundColor: Colors.white),
+                        ),
+                        TextButton.icon(
+                          onPressed: _collecting || _savingSnapshot ? null : _requestSnapshot,
+                          icon: const Icon(Icons.camera_alt_outlined),
+                          label: Text(_savingSnapshot ? 'Menyimpan…' : 'Simpan foto'),
+                          style: TextButton.styleFrom(foregroundColor: Colors.white),
+                        ),
+                      ],
                     ),
                   ),
                   if (_detectorName != null)
