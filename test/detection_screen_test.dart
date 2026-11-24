@@ -4,6 +4,26 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:object_detection/main.dart';
 
 void main() {
+  test('accepts a class supported by distinct photos', () {
+    expect(selectLocalObjectLabel({
+      'toples': [0.08, 0.12, 0.18],
+      'gelas': [0.29, 0.32, 0.38],
+    }, maximumDistance: 0.19), 'toples');
+  });
+
+  test('rejects a class supported only by a single close photo', () {
+    expect(selectLocalObjectLabel({
+      'toples': [0.01, 0.21, 0.22],
+    }, maximumDistance: 0.19), isNull);
+  });
+
+  test('rejects close competing classes even if both pass the threshold', () {
+    expect(selectLocalObjectLabel({
+      'toples': [0.10, 0.11, 0.12],
+      'gelas': [0.11, 0.12, 0.13],
+    }, maximumDistance: 0.19), isNull);
+  });
+
   testWidgets('shows an error and can retry when no rear camera is found', (
     tester,
   ) async {
