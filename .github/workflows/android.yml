@@ -1,0 +1,41 @@
+name: Android test and APK
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.7'
+          channel: stable
+      - name: Generate Android project
+        run: bash setup.sh
+      - name: Analyze and test
+        working-directory: object_detection
+        run: |
+          flutter analyze
+          flutter test
+      - name: Build debug APK
+        working-directory: object_detection
+        run: flutter build apk --debug --target-platform android-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deteksi-objek-android-arm64
+          path: object_detection/build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
