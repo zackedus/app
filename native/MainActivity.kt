@@ -231,28 +231,52 @@ class MainActivity : FlutterActivity() {
                 val green = android.graphics.Color.green(color)
                 val blue = android.graphics.Color.blue(color)
                 luminance[y * size + x] = .299 * red + .587 * green + .114 * blue
-                val total = (red + green + blue).coerceAtLeast(1)
-                colors[(red * 8 / total).coerceAtMost(7)]++
-                colors[8 + (green * 8 / total).coerceAtMost(7)]++
-                colors[16 + (blue * 8 / total).coerceAtMost(7)]++
+                val total = red + green + blue
+                if (total >= 24) {
+                    addColorVote(colors, 0, red.toDouble() / total)
+                    addColorVote(colors, 8, green.toDouble() / total)
+                    addColorVote(colors, 16, blue.toDouble() / total)
+                }
+            }
+        }
+        // Subtract a local mean to suppress shadows and gradual lighting changes.
+        val detail = luminance.copyOf()
+        for (y in 2 until size - 2) {
+            for (x in 2 until size - 2) {
+                var sum = 0.0
+                for (dy in -2..2) {
+                    for (dx in -2..2) sum += luminance[(y + dy) * size + x + dx]
+                }
+                detail[y * size + x] -= sum / 25
             }
         }
         val edges = DoubleArray(32)
-        for (y in 1 until size - 1) {
-            for (x in 1 until size - 1) {
+        for (y in 3 until size - 3) {
+            for (x in 3 until size - 3) {
                 val index = y * size + x
-                val dx = luminance[index + 1] - luminance[index - 1]
-                val dy = luminance[index + size] - luminance[index - size]
+                val dx = detail[index + 1] - detail[index - 1]
+                val dy = detail[index + size] - detail[index - size]
                 val magnitude = hypot(dx, dy)
-                if (magnitude < 6) continue
-                val angle = (atan2(dy, dx) + PI) % PI
-                val bin = (angle * 8 / PI).toInt().coerceIn(0, 7)
+                if (magnitude < 2) continue
+                val orientation = ((atan2(dy, dx) + PI) % PI) * 8 / PI
+                val bin = orientation.toInt().coerceIn(0, 7)
+                val fraction = (orientation - bin).coerceIn(0.0, 1.0)
                 val cell = (y / (size / 2)) * 2 + x / (size / 2)
-                edges[cell * 8 + bin] += magnitude
+                edges[cell * 8 + bin] += magnitude * (1 - fraction)
+                edges[cell * 8 + (bin + 1) % 8] += magnitude * fraction
             }
         }
         val edgeSum = edges.sum().coerceAtLeast(1.0)
-        return edges.map { it / edgeSum } + colors.map { it / (3 * size * size) }
+        val colorSum = colors.sum().coerceAtLeast(1.0)
+        return edges.map { it / edgeSum } + colors.map { it / colorSum }
+    }
+
+    private fun addColorVote(histogram: DoubleArray, offset: Int, value: Double) {
+        val position = value * 7
+        val bin = position.toInt().coerceIn(0, 7)
+        val fraction = position - bin
+        histogram[offset + bin] += 1 - fraction
+        histogram[offset + (bin + 1).coerceAtMost(7)] += fraction
     }
 
     override fun onDestroy() {
