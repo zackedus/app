@@ -136,6 +136,7 @@ class MainActivity : FlutterActivity() {
         val width = requireNotNull(call.argument<Int>("width"))
         val height = requireNotNull(call.argument<Int>("height"))
         val rotation = requireNotNull(call.argument<Int>("rotation"))
+        val focus = call.argument<Boolean>("focus") == true
         val model = detector ?: ObjectDetector.createFromFileAndOptions(
             applicationContext,
             "model.tflite",
@@ -156,19 +157,17 @@ class MainActivity : FlutterActivity() {
                 Matrix().apply { postRotate(rotation.toFloat()) }, true
             )
             try {
+                if (focus) {
+                    val box = RectF(
+                        upright.width * .2f, upright.height * .3f,
+                        upright.width * .8f, upright.height * .7f
+                    )
+                    return listOf(candidate(upright, box, "", 0.0))
+                }
                 return model.detect(TensorImage.fromBitmap(upright)).mapNotNull { detection ->
                     val category = detection.categories.maxByOrNull { it.score }
                         ?: return@mapNotNull null
-                    val box = detection.boundingBox
-                    mapOf(
-                        "label" to category.label,
-                        "appearance" to appearance(upright, box),
-                        "score" to category.score.toDouble(),
-                        "left" to box.left.toDouble() / upright.width,
-                        "top" to box.top.toDouble() / upright.height,
-                        "right" to box.right.toDouble() / upright.width,
-                        "bottom" to box.bottom.toDouble() / upright.height
-                    )
+                    candidate(upright, detection.boundingBox, category.label, category.score.toDouble())
                 }
             } finally {
                 if (upright !== bitmap) upright.recycle()
@@ -177,6 +176,18 @@ class MainActivity : FlutterActivity() {
             bitmap.recycle()
         }
     }
+
+    private fun candidate(
+        bitmap: Bitmap, box: RectF, label: String, score: Double
+    ): Map<String, Any> = mapOf(
+        "label" to label,
+        "appearance" to appearance(bitmap, box),
+        "score" to score,
+        "left" to box.left.toDouble() / bitmap.width,
+        "top" to box.top.toDouble() / bitmap.height,
+        "right" to box.right.toDouble() / bitmap.width,
+        "bottom" to box.bottom.toDouble() / bitmap.height
+    )
 
     private fun learnPhoto(call: MethodCall): List<List<Double>> {
         val path = requireNotNull(call.argument<String>("path"))
