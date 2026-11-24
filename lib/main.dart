@@ -1,6 +1,9 @@
+import 'dart:io';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -29,6 +32,7 @@ class _DetectionScreenState extends State<DetectionScreen>
   Future<void> _cameraWork = Future<void>.value();
   bool _active = true;
   bool _busy = false;
+  bool _collecting = false;
   int _generation = 0;
   String? _error;
   List<_Detection> _detections = [];
@@ -136,6 +140,78 @@ class _DetectionScreenState extends State<DetectionScreen>
     }
   }
 
+  Future<void> _collectExample() async {
+    if (_collecting) return;
+    setState(() => _collecting = true);
+    try {
+      final label = await showDialog<String>(
+        context: context,
+        builder: (context) => const _ExampleLabelDialog(),
+      );
+      if (!mounted || label == null) return;
+      final generation = _generation;
+      final camera = _camera;
+      if (camera == null || !camera.value.isInitialized || !_current(generation)) {
+        throw StateError('Kamera belum siap.');
+      }
+      String? message;
+      _cameraWork = _cameraWork.then((_) async {
+        if (!_current(generation)) return;
+        try {
+          if (camera.value.isStreamingImages) await camera.stopImageStream();
+          if (!_current(generation)) return;
+          final photo = await camera.takePicture();
+          try {
+            final root = await getApplicationDocumentsDirectory();
+            final directory = Directory(
+              '${root.path}/training_examples/$label',
+            );
+            await directory.create(recursive: true);
+            final filename = DateTime.now().microsecondsSinceEpoch;
+            await photo.saveTo('${directory.path}/$filename.jpg');
+            final count = await directory
+                .list()
+                .where((entry) => entry is File && entry.path.endsWith('.jpg'))
+                .length;
+            message = '$label: $count foto contoh tersimpan di HP.';
+          } finally {
+            try {
+              await File(photo.path).delete();
+            } on FileSystemException {
+              // The camera cache can be cleared independently.
+            }
+          }
+        } catch (_) {
+          message = 'Foto contoh gagal disimpan. Coba ambil ulang.';
+        } finally {
+          if (_current(generation)) {
+            try {
+              await camera.startImageStream(
+                (image) => _detect(image, camera, generation),
+              );
+            } catch (_) {
+              _scheduleCamera();
+            }
+          }
+        }
+      });
+      await _cameraWork;
+      if (mounted && message != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message!)),
+        );
+      }
+    } on StateError {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Kamera belum siap. Coba lagi.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _collecting = false);
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -154,6 +230,18 @@ class _DetectionScreenState extends State<DetectionScreen>
         backgroundColor: const Color(0xff121718),
         foregroundColor: Colors.white,
         title: const Text('Deteksi Objek'),
+        actions: [
+          IconButton(
+            tooltip: 'Ajari objek baru',
+            onPressed: _collecting ||
+                    error != null ||
+                    camera == null ||
+                    !camera.value.isInitialized
+                ? null
+                : _collectExample,
+            icon: const Icon(Icons.add_a_photo_outlined),
+          ),
+        ],
       ),
       body: SafeArea(
         child: error != null
@@ -199,6 +287,49 @@ class _DetectionScreenState extends State<DetectionScreen>
                 ],
               ),
       ),
+    );
+  }
+}
+
+class _ExampleLabelDialog extends StatefulWidget {
+  const _ExampleLabelDialog();
+
+  @override
+  State<_ExampleLabelDialog> createState() => _ExampleLabelDialogState();
+}
+
+class _ExampleLabelDialogState extends State<_ExampleLabelDialog> {
+  String _label = '';
+
+  bool get _valid =>
+      RegExp(r'^[a-z0-9]+([ _-][a-z0-9]+)*$').hasMatch(_label);
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Ajari objek baru'),
+      content: TextField(
+        autofocus: true,
+        maxLength: 40,
+        decoration: const InputDecoration(
+          labelText: 'Nama objek',
+          hintText: 'Contoh: helm proyek',
+          helperText: 'Gunakan huruf A–Z dan angka.',
+        ),
+        onChanged: (value) {
+          setState(() => _label = value.trim().toLowerCase());
+        },
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Batal'),
+        ),
+        FilledButton(
+          onPressed: _valid ? () => Navigator.pop(context, _label) : null,
+          child: const Text('Ambil foto'),
+        ),
+      ],
     );
   }
 }
