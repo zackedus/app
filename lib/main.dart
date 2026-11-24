@@ -458,7 +458,7 @@ class _DetectionScreenState extends State<DetectionScreen>
 List<Rect> _parseBoxes(String json, {bool limit = false}) {
   final rows = (jsonDecode(json) as Map<String, dynamic>)['boxes'] as List;
   if (limit && rows.length > 50) throw const FormatException('Too many boxes');
-  return rows.map((row) {
+  return rows.map<Rect>((row) {
     if (row is! List || row.length != 4 ||
         row.any((v) => v is! num || !v.isFinite || v < 0 || v > 1)) {
       throw const FormatException('Invalid coordinates');
@@ -493,22 +493,46 @@ class _DatasetGalleryState extends State<_DatasetGallery> {
     return photos;
   }
 
+  bool _editing = false;
+
+  void _showEditError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
   Future<void> _edit(File photo, String label) async {
+    if (_editing) return;
+    _editing = true;
     try {
       final annotation = File('${photo.path}.json');
-      final boxes = await annotation.exists()
-          ? _parseBoxes(await annotation.readAsString())
-          : <Rect>[];
+      final List<Rect> boxes;
+      try {
+        boxes = await annotation.exists()
+            ? _parseBoxes(await annotation.readAsString())
+            : <Rect>[];
+      } catch (_) {
+        _showEditError('Anotasi lama gagal dibaca. File asli tetap tersimpan.');
+        return;
+      }
       if (!mounted) return;
-      final result = await _openEditor(context, photo, label, boxes);
+      final List<Rect>? result;
+      try {
+        result = await _openEditor(context, photo, label, boxes);
+      } catch (_) {
+        _showEditError('Foto gagal dibuka di editor.');
+        return;
+      }
       if (result == null) return;
-      await _saveAnnotation(photo, label, result);
-      if (mounted) setState(() => _photos = _load());
-    } catch (_) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Foto atau anotasi gagal dibuka atau disimpan.')),
-      );
+      try {
+        await _saveAnnotation(photo, label, result);
+        if (mounted) setState(() => _photos = _load());
+      } catch (_) {
+        _showEditError('Perubahan anotasi gagal disimpan.');
+      }
+    } finally {
+      _editing = false;
     }
   }
 
