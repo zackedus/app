@@ -92,12 +92,14 @@ class _DetectionScreenState extends State<DetectionScreen>
   bool _focusMode = false;
   String? _focusLabel;
   int _focusFrames = 0;
+  bool _focusMissedOnce = false;
 
   void _toggleFocus() {
     setState(() {
       _focusMode = !_focusMode;
       _focusLabel = null;
       _focusFrames = 0;
+      _focusMissedOnce = false;
       _detections = [];
     });
   }
@@ -105,6 +107,11 @@ class _DetectionScreenState extends State<DetectionScreen>
   List<_Detection> _confirmedFocus(List<_Detection> candidates) {
     final candidate = candidates.isEmpty ? null : candidates.first;
     if (candidate == null || !candidate.local) {
+      if (_focusFrames >= 3 && !_focusMissedOnce) {
+        _focusMissedOnce = true;
+        return _detections;
+      }
+      _focusMissedOnce = false;
       _focusLabel = null;
       _focusFrames = 0;
       return [];
@@ -113,6 +120,7 @@ class _DetectionScreenState extends State<DetectionScreen>
       _focusLabel = candidate.label;
       _focusFrames = 0;
     }
+    _focusMissedOnce = false;
     _focusFrames++;
     return _focusFrames >= 3 ? [candidate] : [];
   }
@@ -145,7 +153,7 @@ class _DetectionScreenState extends State<DetectionScreen>
             if (samples == null || samples.isEmpty) continue;
             final photoSamples = samples
                 .map((sample) => sample.cast<num>().map((v) => v.toDouble()).toList())
-                .where((sample) => sample.length == 56 && sample.every((v) => v.isFinite))
+                .where(_hasShape)
                 .toList();
             if (photoSamples.isNotEmpty) (examples[label] ??= []).add(photoSamples);
           } catch (_) {
@@ -167,9 +175,14 @@ class _DetectionScreenState extends State<DetectionScreen>
     }
   }
 
+  bool _hasShape(List<double> values) =>
+      values.length == 56 &&
+      values.every((value) => value.isFinite) &&
+      values.take(32).any((value) => value > 0);
+
   _Detection _matchLocal(_Detection detection) {
     final appearance = detection.appearance;
-    if (appearance.length != 56 || _examples.isEmpty) return detection;
+    if (!_hasShape(appearance) || _examples.isEmpty) return detection;
     String? bestLabel;
     var best = double.infinity;
     var runnerUp = double.infinity;
@@ -187,7 +200,7 @@ class _DetectionScreenState extends State<DetectionScreen>
               color += difference;
             }
           }
-          final distance = (0.7 * shape + 0.3 * color) / 2;
+          final distance = (0.85 * shape + 0.15 * color) / 2;
           if (distance < nearest) nearest = distance;
         }
         return nearest;
