@@ -1,6 +1,14 @@
 package id.rancangpro.object_detection
 
 import android.graphics.Bitmap
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
@@ -21,6 +29,7 @@ class MainActivity : FlutterActivity() {
     private val worker = Executors.newSingleThreadExecutor()
     private var detector: ObjectDetector? = null
     private var channel: MethodChannel? = null
+    private var settingsChannel: MethodChannel? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -43,6 +52,80 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+        settingsChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "object_detection/openrouter_settings"
+        ).also { bridge ->
+            bridge.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "load", "save" -> worker.execute {
+                        try {
+                            val value = if (call.method == "load") loadSettings() else {
+                                saveSettings(
+                                    requireNotNull(call.argument<String>("token")),
+                                    requireNotNull(call.argument<String>("model"))
+                                )
+                                null
+                            }
+                            runOnUiThread { result.success(value) }
+                        } catch (_: Exception) {
+                            runOnUiThread {
+                                result.error("SETTINGS_STORAGE", "Pengaturan tidak bisa diakses.", null)
+                            }
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
+    }
+
+    private fun settingsKey(create: Boolean): SecretKey {
+        val alias = "openrouter_settings_v1"
+        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val stored = store.getKey(alias, null)
+        if (stored is SecretKey) return stored
+        check(create)
+        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+            .apply {
+                init(KeyGenParameterSpec.Builder(
+                    alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .build())
+            }.generateKey()
+    }
+
+    private fun loadSettings(): Map<String, String> {
+        val preferences = getSharedPreferences("openrouter_settings", MODE_PRIVATE)
+        val model = preferences.getString("model", "") ?: ""
+        val ciphertext = preferences.getString("token", null)
+        val token = if (ciphertext == null) "" else try {
+            val iv = Base64.decode(requireNotNull(preferences.getString("iv", null)), Base64.NO_WRAP)
+            Cipher.getInstance("AES/GCM/NoPadding").run {
+                init(Cipher.DECRYPT_MODE, settingsKey(false), GCMParameterSpec(128, iv))
+                String(doFinal(Base64.decode(ciphertext, Base64.NO_WRAP)), Charsets.UTF_8)
+            }
+        } catch (_: Exception) {
+            // A restored installation may lack the original Android Keystore key.
+            ""
+        }
+        return mapOf("token" to token, "model" to model)
+    }
+
+    private fun saveSettings(token: String, model: String) {
+        val editor = getSharedPreferences("openrouter_settings", MODE_PRIVATE)
+            .edit().putString("model", model)
+        if (token.isEmpty()) {
+            editor.remove("token").remove("iv")
+        } else {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, settingsKey(true))
+            editor.putString("token", Base64.encodeToString(
+                cipher.doFinal(token.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP
+            )).putString("iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+        }
+        check(editor.commit())
     }
 
     private fun detect(call: MethodCall): List<Map<String, Any>> {
@@ -144,6 +227,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         channel?.setMethodCallHandler(null)
+        settingsChannel?.setMethodCallHandler(null)
         worker.execute { detector?.close() }
         worker.shutdown()
         super.onDestroy()
