@@ -35,7 +35,26 @@ class _DetectionScreenState extends State<DetectionScreen>
   bool _active = true;
   bool _busy = false;
   bool _collecting = false;
+  static const _defaultOpenRouterModel = 'google/gemini-2.5-flash';
   String? _openRouterKey;
+  String _openRouterModel = _defaultOpenRouterModel;
+
+  Future<void> _openRouterSettings() async {
+    final configuration = await showDialog<(String, String)>(
+      context: context,
+      builder: (_) => _OpenRouterSettingsDialog(
+        _openRouterKey ?? '',
+        _openRouterModel,
+        _defaultOpenRouterModel,
+      ),
+    );
+    if (!mounted || configuration == null) return;
+    setState(() {
+      final (key, model) = configuration;
+      _openRouterKey = key.isEmpty ? null : key;
+      _openRouterModel = model;
+    });
+  }
   int _generation = 0;
   String? _error;
   List<_Detection> _detections = [];
@@ -224,27 +243,18 @@ class _DetectionScreenState extends State<DetectionScreen>
 
   Future<String?> _reviewPhotoWithAi(File photo, String label) async {
     if (!mounted) return null;
-    var key = _openRouterKey ?? '';
+    final key = _openRouterKey;
+    final model = _openRouterModel;
+    if (key == null) {
+      return 'Foto tersimpan. Isi API key di Pengaturan OpenRouter untuk anotasi AI.';
+    }
     final send = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Anotasi dengan OpenRouter'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              'Hanya foto ini yang dikirim ke OpenRouter dan penyedia model. '
-              'Gunakan foto orang yang sudah memberi izin. Penggunaan API bisa dikenai biaya.',
-            ),
-            if (_openRouterKey == null)
-              TextField(
-                obscureText: true,
-                autocorrect: false,
-                enableSuggestions: false,
-                decoration: const InputDecoration(labelText: 'API key OpenRouter'),
-                onChanged: (value) => key = value.trim(),
-              ),
-          ],
+        content: Text(
+          'Foto ini akan dikirim ke OpenRouter dan penyedia model $model. '
+          'Gunakan foto orang yang sudah memberi izin. API bisa dikenai biaya.',
         ),
         actions: [
           TextButton(
@@ -259,25 +269,27 @@ class _DetectionScreenState extends State<DetectionScreen>
       ),
     );
     if (!mounted || send != true) return null;
-    if (key.isEmpty) return 'Foto tersimpan. API key OpenRouter belum diisi.';
 
     try {
-      final boxes = await _requestAiBoxes(photo, label, key);
+      final boxes = await _requestAiBoxes(photo, label, key, model);
       if (!mounted) return null;
-      _openRouterKey = key;
       final reviewed = await _openEditor(context, photo, label, boxes);
       if (reviewed == null) return 'Foto tersimpan tanpa anotasi.';
       await _saveAnnotation(photo, label, reviewed);
       return 'Foto dan ${reviewed.length} anotasi tersimpan di HP.';
     } on _OpenRouterException catch (error) {
-      if (error.status == 401 || error.status == 403) _openRouterKey = null;
+      if (error.status == 401 || error.status == 403) {
+        return 'Foto tersimpan. Periksa API key dan akses model di Pengaturan OpenRouter.';
+      }
       return 'Foto tersimpan. OpenRouter mengembalikan HTTP ${error.status}.';
     } catch (_) {
       return 'Foto tersimpan. Anotasi AI gagal. Periksa koneksi dan coba lagi.';
     }
   }
 
-  Future<List<Rect>> _requestAiBoxes(File photo, String label, String key) async {
+  Future<List<Rect>> _requestAiBoxes(
+    File photo, String label, String key, String model,
+  ) async {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
     try {
       final data = base64Encode(await photo.readAsBytes());
@@ -289,7 +301,7 @@ class _DetectionScreenState extends State<DetectionScreen>
         request.headers.contentType = ContentType.json;
         request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $key');
         request.write(jsonEncode({
-          'model': 'google/gemini-2.5-flash',
+          'model': model,
           'max_tokens': 2048,
           'messages': [
             {
@@ -348,6 +360,11 @@ class _DetectionScreenState extends State<DetectionScreen>
         foregroundColor: Colors.white,
         title: const Text('Deteksi Objek'),
         actions: [
+          IconButton(
+            tooltip: 'Pengaturan OpenRouter',
+            onPressed: _collecting ? null : _openRouterSettings,
+            icon: const Icon(Icons.settings_outlined),
+          ),
           IconButton(
             tooltip: 'Galeri dataset',
             onPressed: _collecting ? null : () => Navigator.of(context).push(
@@ -754,6 +771,92 @@ class _AnnotationEditorState extends State<_AnnotationEditor> {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _OpenRouterSettingsDialog extends StatefulWidget {
+  const _OpenRouterSettingsDialog(this.keyValue, this.model, this.defaultModel);
+
+  final String keyValue;
+  final String model;
+  final String defaultModel;
+
+  @override
+  State<_OpenRouterSettingsDialog> createState() => _OpenRouterSettingsDialogState();
+}
+
+class _OpenRouterSettingsDialogState extends State<_OpenRouterSettingsDialog> {
+  late final _key = TextEditingController(text: widget.keyValue);
+  late final _model = TextEditingController(text: widget.model);
+  final _form = GlobalKey<FormState>();
+
+  @override
+  void dispose() {
+    _key.dispose();
+    _model.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Pengaturan OpenRouter'),
+      scrollable: true,
+      content: Form(
+        key: _form,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextFormField(
+              controller: _key,
+              obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: InputDecoration(
+                labelText: 'API key',
+                suffixIcon: IconButton(
+                  tooltip: 'Kosongkan API key',
+                  onPressed: _key.clear,
+                  icon: const Icon(Icons.clear),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _model,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(labelText: 'ID model vision'),
+              validator: (value) {
+                final id = value?.trim() ?? '';
+                if (!RegExp(r'^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.:-]+$').hasMatch(id)) {
+                  return 'Gunakan format penyedia/nama-model.';
+                }
+                return null;
+              },
+            ),
+            TextButton(
+              onPressed: () => _model.text = widget.defaultModel,
+              child: const Text('Gunakan model bawaan'),
+            ),
+            const Text('Pilih model yang menerima input foto. Pengaturan berlaku selama app terbuka.'),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Batal'),
+        ),
+        FilledButton(
+          onPressed: () {
+            if (!_form.currentState!.validate()) return;
+            Navigator.pop(context, (_key.text.trim(), _model.text.trim()));
+          },
+          child: const Text('Simpan'),
+        ),
+      ],
     );
   }
 }
