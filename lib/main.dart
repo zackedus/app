@@ -35,6 +35,7 @@ class _DetectionScreenState extends State<DetectionScreen>
   bool _active = true;
   bool _busy = false;
   bool _collecting = false;
+  String? _exampleLabel;
   static const _defaultOpenRouterModel = 'google/gemini-2.5-flash';
   String? _openRouterKey;
   String _openRouterModel = _defaultOpenRouterModel;
@@ -162,15 +163,16 @@ class _DetectionScreenState extends State<DetectionScreen>
     }
   }
 
-  Future<void> _collectExample() async {
+  Future<void> _collectExample({bool chooseLabel = false}) async {
     if (_collecting) return;
     setState(() => _collecting = true);
     try {
-      final label = await showDialog<String>(
+      final label = (chooseLabel ? null : _exampleLabel) ?? await showDialog<String>(
         context: context,
         builder: (context) => const _ExampleLabelDialog(),
       );
       if (!mounted || label == null) return;
+      setState(() => _exampleLabel = label);
       final generation = _generation;
       final camera = _camera;
       if (camera == null || !camera.value.isInitialized || !_current(generation)) {
@@ -372,16 +374,6 @@ class _DetectionScreenState extends State<DetectionScreen>
             ),
             icon: const Icon(Icons.photo_library_outlined),
           ),
-          IconButton(
-            tooltip: 'Ajari objek baru',
-            onPressed: _collecting ||
-                    error != null ||
-                    camera == null ||
-                    !camera.value.isInitialized
-                ? null
-                : _collectExample,
-            icon: const Icon(Icons.add_a_photo_outlined),
-          ),
         ],
       ),
       body: SafeArea(
@@ -423,6 +415,37 @@ class _DetectionScreenState extends State<DetectionScreen>
                           ? 'Arahkan kamera ke objek'
                           : '${_detections.length} objek terdeteksi',
                       style: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _collecting ? null : () => _collectExample(),
+                          icon: const Icon(Icons.add_a_photo_outlined),
+                          label: Text(
+                            _collecting
+                                ? 'Sedang memproses foto…'
+                                : _exampleLabel == null
+                                    ? 'Tambahkan objek baru'
+                                    : 'Ambil foto contoh · $_exampleLabel',
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (_exampleLabel != null)
+                          TextButton(
+                            onPressed: _collecting
+                                ? null
+                                : () => _collectExample(chooseLabel: true),
+                            style: TextButton.styleFrom(
+                              foregroundColor: Colors.white,
+                            ),
+                            child: const Text('Ganti atau tambah jenis objek'),
+                          ),
+                      ],
                     ),
                   ),
                 ],
@@ -883,14 +906,14 @@ class _ExampleLabelDialogState extends State<_ExampleLabelDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('Ajari objek baru'),
+      title: const Text('Pilih nama objek'),
       content: TextField(
         autofocus: true,
         maxLength: 40,
         decoration: const InputDecoration(
           labelText: 'Nama objek',
           hintText: 'Contoh: helm proyek',
-          helperText: 'Gunakan huruf A–Z dan angka.',
+          helperText: 'Arahkan kamera ke objek sebelum mengambil foto.',
         ),
         onChanged: (value) {
           setState(() => _label = value.trim().toLowerCase());
