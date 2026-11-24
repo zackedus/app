@@ -176,9 +176,9 @@ class _DetectionScreenState extends State<DetectionScreen>
   }
 
   bool _hasShape(List<double> values) =>
-      values.length == 56 &&
+      values.length >= 56 &&
       values.every((value) => value.isFinite) &&
-      values.take(32).any((value) => value > 0);
+      (values.length > 56 || values.take(32).any((value) => value > 0));
 
   _Detection _matchLocal(_Detection detection) {
     final appearance = detection.appearance;
@@ -190,7 +190,7 @@ class _DetectionScreenState extends State<DetectionScreen>
         for (final reference in photo) {
           var shape = 0.0;
           var color = 0.0;
-          for (var i = 0; i < appearance.length; i++) {
+          for (var i = 0; i < 56; i++) {
             final difference = (appearance[i] - reference[i]).abs();
             if (i < 32) {
               shape += difference;
@@ -198,7 +198,19 @@ class _DetectionScreenState extends State<DetectionScreen>
               color += difference;
             }
           }
-          final distance = (0.85 * shape + 0.15 * color) / 2;
+          final basic = (0.85 * shape + 0.15 * color) / 2;
+          var distance = basic;
+          if (appearance.length > 56 && appearance.length == reference.length) {
+            var cosine = 0.0;
+            for (var i = 56; i < appearance.length; i++) {
+              cosine += appearance[i] * reference[i];
+            }
+            final embeddingDistance = (1 - cosine.clamp(-1.0, 1.0)) / 2;
+            distance = 0.8 * embeddingDistance + 0.2 * basic;
+          } else if (appearance.length != reference.length) {
+            // A missing embedding cannot overrule evidence from the model.
+            continue;
+          }
           if (distance < nearest) nearest = distance;
         }
         return nearest;
@@ -307,6 +319,7 @@ class _DetectionScreenState extends State<DetectionScreen>
             'height': image.height,
             'rotation': camera.description.sensorOrientation,
             'focus': focus,
+            'compareExamples': _examples.isNotEmpty,
           });
       if (_current(generation) && focus == _focusMode) {
         setState(() {
