@@ -5,6 +5,8 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.RectF
+import kotlin.math.roundToInt
 import android.graphics.YuvImage
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -27,13 +29,13 @@ class MainActivity : FlutterActivity() {
             "object_detection/detector"
         ).also { bridge ->
             bridge.setMethodCallHandler { call, result ->
-                if (call.method != "detect") {
+                if (call.method != "detect" && call.method != "learnPhoto") {
                     result.notImplemented()
                     return@setMethodCallHandler
                 }
                 worker.execute {
                     try {
-                        val detections = detect(call)
+                        val detections = if (call.method == "detect") detect(call) else learnPhoto(call)
                         runOnUiThread { result.success(detections) }
                     } catch (error: Exception) {
                         runOnUiThread { result.error("DETECT", error.message, null) }
@@ -74,6 +76,7 @@ class MainActivity : FlutterActivity() {
                     val box = detection.boundingBox
                     mapOf(
                         "label" to category.label,
+                        "appearance" to appearance(upright, box),
                         "score" to category.score.toDouble(),
                         "left" to box.left.toDouble() / upright.width,
                         "top" to box.top.toDouble() / upright.height,
@@ -87,6 +90,56 @@ class MainActivity : FlutterActivity() {
         } finally {
             bitmap.recycle()
         }
+    }
+
+    private fun learnPhoto(call: MethodCall): List<List<Double>> {
+        val path = requireNotNull(call.argument<String>("path"))
+        require(path.startsWith(filesDir.parentFile!!.absolutePath + "/"))
+        val boxes = requireNotNull(call.argument<List<List<Number>>>("boxes"))
+        val photo = if (android.os.Build.VERSION.SDK_INT >= 28) {
+            android.graphics.ImageDecoder.decodeBitmap(
+                android.graphics.ImageDecoder.createSource(java.io.File(path))
+            ) { decoder, _, _ ->
+                decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+            }
+        } else {
+            checkNotNull(BitmapFactory.decodeFile(path))
+        }
+        try {
+            return boxes.map { box ->
+                appearance(photo, RectF(
+                    box[0].toFloat() * photo.width,
+                    box[1].toFloat() * photo.height,
+                    box[2].toFloat() * photo.width,
+                    box[3].toFloat() * photo.height
+                ))
+            }
+        } finally {
+            photo.recycle()
+        }
+    }
+
+    private fun appearance(bitmap: Bitmap, box: RectF): List<Double> {
+        val features = ArrayList<Double>(48)
+        for (row in 0 until 4) {
+            for (column in 0 until 4) {
+                val colors = DoubleArray(3)
+                for (y in 0 until 3) {
+                    for (x in 0 until 3) {
+                        val px = (box.left + (column + (x + 0.5) / 3) * box.width() / 4)
+                            .roundToInt().coerceIn(0, bitmap.width - 1)
+                        val py = (box.top + (row + (y + 0.5) / 3) * box.height() / 4)
+                            .roundToInt().coerceIn(0, bitmap.height - 1)
+                        val color = bitmap.getPixel(px, py)
+                        colors[0] += android.graphics.Color.red(color).toDouble()
+                        colors[1] += android.graphics.Color.green(color).toDouble()
+                        colors[2] += android.graphics.Color.blue(color).toDouble()
+                    }
+                }
+                colors.forEach { features.add(it / 2295.0) }
+            }
+        }
+        return features
     }
 
     override fun onDestroy() {
