@@ -20,6 +20,7 @@ cp native/MainActivity.kt "$app/src/main/kotlin/id/rancangpro/object_detection/M
 
 python3 - "$app" <<'PY'
 from pathlib import Path
+import os
 import sys
 
 app = Path(sys.argv[1])
@@ -43,6 +44,24 @@ assert "android {" in source and "minSdk = flutter.minSdkVersion" in source
 source = source.replace("android {", 'android {\n    androidResources {\n        noCompress += "tflite"\n    }\n', 1)
 source = source.replace("minSdk = flutter.minSdkVersion", "minSdk = maxOf(flutter.minSdkVersion, 24)", 1)
 source += '\ndependencies {\n    implementation("org.tensorflow:tensorflow-lite-task-vision:0.4.4")\n}\n'
+if os.environ.get("ANDROID_RELEASE") == "1":
+    base_id = 'applicationId = "id.rancangpro.object_detection"'
+    debug_signing = 'signingConfig = signingConfigs.getByName("debug")'
+    if base_id not in source or debug_signing not in source:
+        raise RuntimeError("Template Android berubah. Periksa konfigurasi rilis.")
+    source = source.replace(base_id, 'applicationId = "id.rancangpro.object_detection.release"')
+    source = source.replace('android {', """android {
+    signingConfigs {
+        create("persistentRelease") {
+            storeFile = file(System.getenv("ANDROID_KEYSTORE_PATH"))
+            storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+            keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+        }
+    }
+""", 1)
+    source = source.replace(debug_signing, 'signingConfig = signingConfigs.getByName("persistentRelease")')
+    manifest.write_text(xml.replace('android:label="Deteksi Objek"', 'android:label="Deteksi Objek Rilis"'))
 gradle.write_text(source)
 PY
 
