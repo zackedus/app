@@ -27,6 +27,7 @@ manifest = app / "src/main/AndroidManifest.xml"
 xml = manifest.read_text()
 xml = xml.replace(
     "    <application",
+    '    <uses-permission android:name="android.permission.INTERNET" />\n'
     '    <uses-permission android:name="android.permission.CAMERA" />\n'
     '    <uses-feature android:name="android.hardware.camera" android:required="true" />\n'
     '    <application',
