@@ -35,7 +35,7 @@ jobs:
         run: |
           test -n "$KEYSTORE_BASE64" || { echo 'Set ANDROID_RELEASE_KEYSTORE_BASE64 first.'; exit 1; }
           umask 077
-          ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/deteksi-objek-release.jks"
+          ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/deteksi-objek-release.p12"
           printf 'ANDROID_KEYSTORE_PATH=%s\n' "$ANDROID_KEYSTORE_PATH" >> "$GITHUB_ENV"
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
       - name: Generate Android project
@@ -55,6 +55,9 @@ jobs:
         run: |
           test -n "$ANDROID_KEYSTORE_PASSWORD" && test -n "$ANDROID_KEY_ALIAS" &&
             test -n "$ANDROID_KEY_PASSWORD" && test -n "$EXPECTED_CERT"
+          keytool -list -storetype PKCS12 -keystore "$ANDROID_KEYSTORE_PATH" \
+            -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" >/dev/null
+          test "$ANDROID_KEY_PASSWORD" = "$ANDROID_KEYSTORE_PASSWORD"
           flutter build apk --release --target-platform android-arm64 --build-number "$GITHUB_RUN_NUMBER"
           signer="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)"
           test -x "$signer"
