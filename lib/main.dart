@@ -87,12 +87,12 @@ class _DetectionScreenState extends State<DetectionScreen>
   int _generation = 0;
   String? _error;
   List<_Detection> _detections = [];
-  Map<String, List<List<double>>> _examples = {};
+  Map<String, List<List<List<double>>>> _examples = {};
   int _learningRevision = 0;
 
   Future<void> _learnApprovedExamples() async {
     final revision = ++_learningRevision;
-    final examples = <String, List<List<double>>>{};
+    final examples = <String, List<List<List<double>>>>{};
     try {
       final root = await getApplicationDocumentsDirectory();
       final dataset = Directory('${root.path}/training_examples');
@@ -116,9 +116,11 @@ class _DetectionScreenState extends State<DetectionScreen>
               },
             );
             if (samples == null || samples.isEmpty) continue;
-            // One prototype per photo so duplicate boxes do not qualify a class.
-            final sample = samples.first.cast<num>().map((v) => v.toDouble()).toList();
-            if (sample.length == 48) (examples[label] ??= []).add(sample);
+            final photoSamples = samples
+                .map((sample) => sample.cast<num>().map((v) => v.toDouble()).toList())
+                .where((sample) => sample.length == 56 && sample.every((v) => v.isFinite))
+                .toList();
+            if (photoSamples.isNotEmpty) (examples[label] ??= []).add(photoSamples);
           } catch (_) {
             // A damaged photo or annotation does not block other examples.
           }
@@ -135,19 +137,30 @@ class _DetectionScreenState extends State<DetectionScreen>
 
   _Detection _matchLocal(_Detection detection) {
     final appearance = detection.appearance;
-    if (appearance.length != 48 || _examples.isEmpty) return detection;
+    if (appearance.length != 56 || _examples.isEmpty) return detection;
     String? bestLabel;
     var best = double.infinity;
     var runnerUp = double.infinity;
     for (final entry in _examples.entries) {
-      final distances = entry.value.map((reference) {
-        var sum = 0.0;
-        for (var i = 0; i < appearance.length; i++) {
-          final difference = appearance[i] - reference[i];
-          sum += difference * difference;
+      final distances = entry.value.map((photo) {
+        var nearest = double.infinity;
+        for (final reference in photo) {
+          var shape = 0.0;
+          var color = 0.0;
+          for (var i = 0; i < appearance.length; i++) {
+            final difference = (appearance[i] - reference[i]).abs();
+            if (i < 32) {
+              shape += difference;
+            } else {
+              color += difference;
+            }
+          }
+          final distance = (0.7 * shape + 0.3 * color) / 2;
+          if (distance < nearest) nearest = distance;
         }
-        return sum / appearance.length;
+        return nearest;
       }).toList()..sort();
+      // Agreement must come from two different annotated photos.
       final distance = (distances[0] + distances[1]) / 2;
       if (distance < best) {
         runnerUp = best;
@@ -157,7 +170,7 @@ class _DetectionScreenState extends State<DetectionScreen>
         runnerUp = distance;
       }
     }
-    if (bestLabel == null || best > 0.012 || runnerUp - best < 0.004) {
+    if (bestLabel == null || best > (detection.score < 0.5 ? 0.19 : 0.25) || runnerUp - best < 0.06) {
       return detection;
     }
     return _Detection(detection.box, bestLabel, detection.score, appearance, local: true);
@@ -256,7 +269,12 @@ class _DetectionScreenState extends State<DetectionScreen>
           });
       if (_current(generation)) {
         setState(() {
-          _detections = (result ?? []).map(_Detection.fromMap).map(_matchLocal).toList();
+          _detections = (result ?? [])
+              .map(_Detection.fromMap)
+              .map(_matchLocal)
+              .where((detection) => detection.local || detection.score >= 0.5)
+              .take(8)
+              .toList();
         });
       }
     } catch (error) {
