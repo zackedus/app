@@ -30,6 +30,8 @@ class DetectionScreen extends StatefulWidget {
 class _DetectionScreenState extends State<DetectionScreen>
     with WidgetsBindingObserver {
   static const _detector = MethodChannel('object_detection/detector');
+  static const _settings = MethodChannel('object_detection/openrouter_settings');
+  late final Future<void> _settingsReady;
   CameraController? _camera;
   Future<void> _cameraWork = Future<void>.value();
   bool _active = true;
@@ -40,7 +42,24 @@ class _DetectionScreenState extends State<DetectionScreen>
   String? _openRouterKey;
   String _openRouterModel = _defaultOpenRouterModel;
 
+  Future<void> _loadOpenRouterSettings() async {
+    try {
+      final values = await _settings.invokeMapMethod<String, String>('load');
+      if (!mounted || values == null) return;
+      final token = values['token'];
+      final model = values['model'];
+      _openRouterKey = (token == null || token.isEmpty) ? null : token;
+      if (model != null && model.isNotEmpty) _openRouterModel = model;
+    } on PlatformException {
+      // Defaults allow offline use while settings storage is unavailable.
+    } on MissingPluginException {
+      // Android owns secure settings storage.
+    }
+  }
+
   Future<void> _openRouterSettings() async {
+    await _settingsReady;
+    if (!mounted) return;
     final configuration = await showDialog<(String, String)>(
       context: context,
       builder: (_) => _OpenRouterSettingsDialog(
@@ -50,11 +69,20 @@ class _DetectionScreenState extends State<DetectionScreen>
       ),
     );
     if (!mounted || configuration == null) return;
-    setState(() {
-      final (key, model) = configuration;
-      _openRouterKey = key.isEmpty ? null : key;
-      _openRouterModel = model;
-    });
+    final (key, model) = configuration;
+    try {
+      await _settings.invokeMethod<void>('save', {'token': key, 'model': model});
+      if (!mounted) return;
+      setState(() {
+        _openRouterKey = key.isEmpty ? null : key;
+        _openRouterModel = model;
+      });
+    } on PlatformException {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Pengaturan gagal disimpan. Coba lagi.')),
+      );
+    }
   }
   int _generation = 0;
   String? _error;
@@ -139,6 +167,7 @@ class _DetectionScreenState extends State<DetectionScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _settingsReady = _loadOpenRouterSettings();
     _scheduleCamera();
     _learnApprovedExamples();
   }
@@ -320,6 +349,7 @@ class _DetectionScreenState extends State<DetectionScreen>
   }
 
   Future<String?> _reviewPhotoWithAi(File photo, String label) async {
+    await _settingsReady;
     if (!mounted) return null;
     final key = _openRouterKey;
     final model = _openRouterModel;
@@ -972,7 +1002,7 @@ class _OpenRouterSettingsDialogState extends State<_OpenRouterSettingsDialog> {
               onPressed: () => _model.text = widget.defaultModel,
               child: const Text('Gunakan model bawaan'),
             ),
-            const Text('Pilih model yang menerima input foto. Pengaturan berlaku selama app terbuka.'),
+            const Text('Pilih model yang menerima input foto. Pengaturan disimpan di HP.'),
           ],
         ),
       ),
