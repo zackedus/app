@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -33,6 +35,7 @@ class _DetectionScreenState extends State<DetectionScreen>
   bool _active = true;
   bool _busy = false;
   bool _collecting = false;
+  String? _openRouterKey;
   int _generation = 0;
   String? _error;
   List<_Detection> _detections = [];
@@ -155,6 +158,7 @@ class _DetectionScreenState extends State<DetectionScreen>
         throw StateError('Kamera belum siap.');
       }
       String? message;
+      File? savedPhoto;
       _cameraWork = _cameraWork.then((_) async {
         if (!_current(generation)) return;
         try {
@@ -168,7 +172,9 @@ class _DetectionScreenState extends State<DetectionScreen>
             );
             await directory.create(recursive: true);
             final filename = DateTime.now().microsecondsSinceEpoch;
-            await photo.saveTo('${directory.path}/$filename.jpg');
+            final file = File('${directory.path}/$filename.jpg');
+            await photo.saveTo(file.path);
+            savedPhoto = file;
             final count = await directory
                 .list()
                 .where((entry) => entry is File && entry.path.endsWith('.jpg'))
@@ -196,6 +202,10 @@ class _DetectionScreenState extends State<DetectionScreen>
         }
       });
       await _cameraWork;
+      final photo = savedPhoto;
+      if (mounted && photo != null) {
+        message = await _reviewPhotoWithAi(photo, label) ?? message;
+      }
       if (mounted && message != null) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(message!)),
@@ -209,6 +219,182 @@ class _DetectionScreenState extends State<DetectionScreen>
       }
     } finally {
       if (mounted) setState(() => _collecting = false);
+    }
+  }
+
+  Future<String?> _reviewPhotoWithAi(File photo, String label) async {
+    if (!mounted) return null;
+    var key = _openRouterKey ?? '';
+    final send = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Anotasi dengan OpenRouter'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Hanya foto ini yang dikirim ke OpenRouter dan penyedia model. '
+              'Gunakan foto orang yang sudah memberi izin. Penggunaan API bisa dikenai biaya.',
+            ),
+            if (_openRouterKey == null)
+              TextField(
+                obscureText: true,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: const InputDecoration(labelText: 'API key OpenRouter'),
+                onChanged: (value) => key = value.trim(),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Lewati'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Kirim foto'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || send != true) return null;
+    if (key.isEmpty) return 'Foto tersimpan. API key OpenRouter belum diisi.';
+
+    try {
+      final boxes = await _requestAiBoxes(photo, label, key);
+      if (!mounted) return null;
+      _openRouterKey = key;
+      if (boxes.isEmpty) return 'Foto tersimpan. AI tidak menemukan objek.';
+      final codec = await ui.instantiateImageCodec(await photo.readAsBytes());
+      final frame = await codec.getNextFrame();
+      final ratio = frame.image.width / frame.image.height;
+      frame.image.dispose();
+      codec.dispose();
+      if (!mounted) return null;
+
+      final approve = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('Periksa kotak: $label'),
+          content: AspectRatio(
+            aspectRatio: ratio,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                Image.file(photo, fit: BoxFit.fill),
+                LayoutBuilder(
+                  builder: (context, constraints) => Stack(
+                    children: [
+                      for (final box in boxes)
+                        Positioned(
+                          left: box.left * constraints.maxWidth,
+                          top: box.top * constraints.maxHeight,
+                          width: box.width * constraints.maxWidth,
+                          height: box.height * constraints.maxHeight,
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              border: Border.all(color: Colors.greenAccent, width: 3),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Tolak'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Simpan anotasi'),
+            ),
+          ],
+        ),
+      );
+      if (approve != true) return 'Foto tersimpan tanpa anotasi.';
+      final output = File('${photo.path}.json');
+      final pending = File('${output.path}.tmp');
+      await pending.writeAsString(jsonEncode({
+        'label': label,
+        'boxes': boxes
+            .map((box) => [box.left, box.top, box.right, box.bottom])
+            .toList(),
+      }), flush: true);
+      await pending.rename(output.path);
+      return 'Foto dan ${boxes.length} anotasi tersimpan di HP.';
+    } on _OpenRouterException catch (error) {
+      if (error.status == 401 || error.status == 403) _openRouterKey = null;
+      return 'Foto tersimpan. OpenRouter mengembalikan HTTP ${error.status}.';
+    } catch (_) {
+      return 'Foto tersimpan. Anotasi AI gagal. Periksa koneksi dan coba lagi.';
+    }
+  }
+
+  Future<List<Rect>> _requestAiBoxes(File photo, String label, String key) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    try {
+      final data = base64Encode(await photo.readAsBytes());
+      final reply = await (() async {
+        final request = await client.postUrl(
+          Uri.https('openrouter.ai', '/api/v1/chat/completions'),
+        );
+        request.followRedirects = false;
+        request.headers.contentType = ContentType.json;
+        request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $key');
+        request.write(jsonEncode({
+          'model': 'google/gemini-2.5-flash',
+          'max_tokens': 2048,
+          'messages': [
+            {
+              'role': 'user',
+              'content': [
+                {
+                  'type': 'text',
+                  'text': 'Find visible instances of the object class "$label". '
+                      'A face is a generic class. Never identify a person. '
+                      'Return only JSON {"boxes":[[left,top,right,bottom]]}. '
+                      'Coordinates are numbers between 0 and 1 relative to the '
+                      'full image. If none is visible, return {"boxes":[]}.',
+                },
+                {
+                  'type': 'image_url',
+                  'image_url': {'url': 'data:image/jpeg;base64,$data'},
+                },
+              ],
+            },
+          ],
+        }));
+        final response = await request.close();
+        if (response.statusCode != 200) {
+          throw _OpenRouterException(response.statusCode);
+        }
+        return utf8.decoder.bind(response).join();
+      })().timeout(const Duration(seconds: 45));
+      final envelope = jsonDecode(reply) as Map<String, dynamic>;
+      final choices = envelope['choices'] as List<dynamic>;
+      final content = (choices.first['message']['content'] as String).trim();
+      final json = content
+          .replaceFirst(RegExp(r'^\s*```(?:json)?\s*'), '')
+          .replaceFirst(RegExp(r'\s*```\s*$'), '');
+      final rows = (jsonDecode(json) as Map<String, dynamic>)['boxes'] as List;
+      if (rows.length > 50) throw const FormatException('Too many boxes');
+      return rows.map((row) {
+        if (row is! List || row.length != 4 ||
+            row.any((v) => v is! num || !v.isFinite || v < 0 || v > 1)) {
+          throw const FormatException('Invalid coordinates');
+        }
+        final values = row.cast<num>().map((v) => v.toDouble()).toList();
+        final box = Rect.fromLTRB(values[0], values[1], values[2], values[3]);
+        if (box.isEmpty) throw const FormatException('Empty box');
+        return box;
+      }).toList();
+    } finally {
+      client.close(force: true);
     }
   }
 
@@ -289,6 +475,12 @@ class _DetectionScreenState extends State<DetectionScreen>
       ),
     );
   }
+}
+
+class _OpenRouterException implements Exception {
+  const _OpenRouterException(this.status);
+
+  final int status;
 }
 
 class _ExampleLabelDialog extends StatefulWidget {
