@@ -243,6 +243,21 @@ class _DetectionScreenState extends State<DetectionScreen>
     _settingsReady = _loadOpenRouterSettings();
     _scheduleCamera();
     _learnApprovedExamples();
+    _loadDetectorInfo();
+  }
+
+  String? _detectorName;
+
+  Future<void> _loadDetectorInfo() async {
+    try {
+      final info = await _detector.invokeMapMethod<String, Object?>('detectorInfo');
+      if (!mounted || info == null) return;
+      setState(() => _detectorName = info['name'] as String?);
+    } on PlatformException {
+      // The status line is optional.
+    } on MissingPluginException {
+      // Widget tests run without the Android side.
+    }
   }
 
   @override
@@ -568,6 +583,12 @@ class _DetectionScreenState extends State<DetectionScreen>
                       style: const TextStyle(color: Colors.white),
                     ),
                   ),
+                  if (_detectorName != null)
+                    Text(
+                      'Model: $_detectorName',
+                      style: const TextStyle(color: Colors.white54, fontSize: 12),
+                      textAlign: TextAlign.center,
+                    ),
                   if (_examples.isNotEmpty)
                     Text(
                       '${_examples.length} kelas contoh aktif',

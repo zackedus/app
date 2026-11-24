@@ -43,6 +43,9 @@ class MainActivity : FlutterActivity() {
     private val worker = Executors.newSingleThreadExecutor()
     private val exportWorker = Executors.newSingleThreadExecutor()
     private var detector: ObjectDetector? = null
+    private var customDetector: RfDetrDetector? = null
+    private var customChecked = false
+    private var customError: String? = null
     private var embedder: ImageEmbedder? = null
     private var embeddingUnavailable = false
     private var channel: MethodChannel? = null
@@ -56,7 +59,7 @@ class MainActivity : FlutterActivity() {
         ).also { bridge ->
             bridge.setMethodCallHandler { call, result ->
                 if (call.method != "detect" && call.method != "learnPhoto" &&
-                    call.method != "exportDataset") {
+                    call.method != "exportDataset" && call.method != "detectorInfo") {
                     result.notImplemented()
                     return@setMethodCallHandler
                 }
@@ -67,6 +70,7 @@ class MainActivity : FlutterActivity() {
                         val detections = when (call.method) {
                             "detect" -> detect(call)
                             "learnPhoto" -> learnPhoto(call)
+                            "detectorInfo" -> detectorInfo()
                             else -> exportDataset(call)
                         }
                         runOnUiThread { result.success(detections) }
@@ -159,7 +163,8 @@ class MainActivity : FlutterActivity() {
         val rotation = requireNotNull(call.argument<Int>("rotation"))
         val focus = call.argument<Boolean>("focus") == true
         val compareExamples = call.argument<Boolean>("compareExamples") == true
-        val model = detector ?: ObjectDetector.createFromOptions(
+        val custom = customModel()
+        val model = if (custom != null) null else detector ?: ObjectDetector.createFromOptions(
             applicationContext,
             ObjectDetector.ObjectDetectorOptions.builder()
                 .setBaseOptions(BaseOptions.builder().setModelAssetPath("model.tflite").build())
@@ -184,10 +189,16 @@ class MainActivity : FlutterActivity() {
                     )
                     return listOf(candidate(upright, box, "", 0.0, true))
                 }
+                if (custom != null) {
+                    return custom.detect(upright, 0.35f, 16).mapIndexed { index, found ->
+                        candidate(upright, found.box, found.label, found.score.toDouble(),
+                            compareExamples && index < 8)
+                    }
+                }
                 // Closing an MPImage may recycle its bitmap, so close it only after all crops.
                 val input = BitmapImageBuilder(upright).build()
                 try {
-                    return model.detect(input).detections().mapNotNull { detection ->
+                    return checkNotNull(model).detect(input).detections().mapNotNull { detection ->
                         val category = detection.categories().maxByOrNull { it.score() }
                             ?: return@mapNotNull null
                         Triple(detection.boundingBox(), category.categoryName(), category.score())
@@ -203,6 +214,36 @@ class MainActivity : FlutterActivity() {
             }
         } finally {
             bitmap.recycle()
+        }
+    }
+
+    // A fine-tuned RF-DETR model bundled as custom_model.tflite replaces the COCO detector.
+    private fun customModel(): RfDetrDetector? {
+        if (!customChecked) {
+            customChecked = true
+            val assetNames = assets.list("")?.toSet() ?: emptySet()
+            if ("custom_model.tflite" in assetNames && "custom_model.tflite.rfdetr.json" in assetNames) {
+                try {
+                    customDetector = RfDetrDetector(
+                        applicationContext, "custom_model.tflite", "custom_model.tflite.rfdetr.json"
+                    )
+                } catch (error: Exception) {
+                    // Fall back to the COCO detector and tell the UI why.
+                    customError = error.message ?: error.javaClass.simpleName
+                }
+            }
+        }
+        return customDetector
+    }
+
+    private fun detectorInfo(): Map<String, Any> {
+        val custom = customModel()
+        return if (custom != null) {
+            mapOf("name" to "RF-DETR kustom", "classes" to custom.classNames)
+        } else {
+            val name = customError?.let { "EfficientDet-Lite0 (COCO) — model kustom gagal: $it" }
+                ?: "EfficientDet-Lite0 (COCO)"
+            mapOf("name" to name, "classes" to emptyList<String>())
         }
     }
 
@@ -499,6 +540,7 @@ class MainActivity : FlutterActivity() {
         settingsChannel?.setMethodCallHandler(null)
         worker.execute {
             detector?.close()
+            customDetector?.close()
             embedder?.close()
         }
         worker.shutdown()
