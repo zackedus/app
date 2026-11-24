@@ -7,6 +7,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'src/annotations.dart';
+import 'src/labels.dart';
+import 'src/matching.dart';
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
@@ -38,7 +42,9 @@ class _DetectionScreenState extends State<DetectionScreen>
   bool _busy = false;
   bool _collecting = false;
   String? _exampleLabel;
-  static const _defaultOpenRouterModel = 'google/gemini-2.5-flash';
+  static const _defaultOpenRouterModel = 'google/gemini-3.8-flash';
+  // Gemini 2.5 Flash is deprecated; settings saved with the old default move on.
+  static const _retiredDefaultModels = {'google/gemini-2.5-flash'};
   String? _openRouterKey;
   String _openRouterModel = _defaultOpenRouterModel;
 
@@ -49,7 +55,11 @@ class _DetectionScreenState extends State<DetectionScreen>
       final token = values['token'];
       final model = values['model'];
       _openRouterKey = (token == null || token.isEmpty) ? null : token;
-      if (model != null && model.isNotEmpty) _openRouterModel = model;
+      if (model != null &&
+          model.isNotEmpty &&
+          !_retiredDefaultModels.contains(model)) {
+        _openRouterModel = model;
+      }
     } on PlatformException {
       // Defaults allow offline use while settings storage is unavailable.
     } on MissingPluginException {
@@ -86,6 +96,7 @@ class _DetectionScreenState extends State<DetectionScreen>
   }
   int _generation = 0;
   String? _error;
+  final _frameFailures = FailureGate();
   List<_Detection> _detections = [];
   Map<String, List<List<List<double>>>> _examples = {};
   int _learningRevision = 0;
@@ -136,25 +147,14 @@ class _DetectionScreenState extends State<DetectionScreen>
           if (!mounted || revision != _learningRevision) return;
           if (entry is! File || !entry.path.endsWith('.jpg.json')) continue;
           try {
-            final json = await entry.readAsString();
-            final boxes = _parseBoxes(json);
+            final annotation = await entry.readAsString();
+            final boxes = parseBoxes(annotation);
             if (boxes.isEmpty) continue;
             final label = entry.parent.uri.pathSegments.lastWhere(
               (segment) => segment.isNotEmpty,
             );
-            final samples = await _detector.invokeListMethod<List<Object?>>(
-              'learnPhoto',
-              {
-                'path': entry.path.substring(0, entry.path.length - 5),
-                'boxes': boxes.map((box) =>
-                    [box.left, box.top, box.right, box.bottom]).toList(),
-              },
-            );
-            if (samples == null || samples.isEmpty) continue;
-            final photoSamples = samples
-                .map((sample) => sample.cast<num>().map((v) => v.toDouble()).toList())
-                .where(_hasShape)
-                .toList();
+            final photoPath = entry.path.substring(0, entry.path.length - 5);
+            final photoSamples = await _cachedSamples(photoPath, annotation, boxes);
             if (photoSamples.isNotEmpty) (examples[label] ??= []).add(photoSamples);
           } catch (_) {
             // A damaged photo or annotation does not block other examples.
@@ -175,50 +175,63 @@ class _DetectionScreenState extends State<DetectionScreen>
     }
   }
 
-  bool _hasShape(List<double> values) =>
-      values.length >= 56 &&
-      values.every((value) => value.isFinite) &&
-      (values.length > 56 || values.take(32).any((value) => value > 0));
+  static const _featureCacheVersion = 1;
+
+  /// Feature vectors are cached next to the photo and reused while the
+  /// annotation is unchanged, so only new or edited photos are processed.
+  Future<List<List<double>>> _cachedSamples(
+    String photoPath, String annotation, List<Rect> boxes,
+  ) async {
+    final cache = File('$photoPath.vec.json');
+    try {
+      if (await cache.exists()) {
+        final stored = jsonDecode(await cache.readAsString()) as Map<String, dynamic>;
+        if (stored['version'] == _featureCacheVersion &&
+            stored['annotation'] == annotation) {
+          final samples = (stored['samples'] as List)
+              .map((sample) => (sample as List).cast<num>().map((v) => v.toDouble()).toList())
+              .where(hasShape)
+              .toList();
+          if (samples.isNotEmpty) return samples;
+        }
+      }
+    } catch (_) {
+      // A damaged cache is rebuilt below.
+    }
+    final samples = await _detector.invokeListMethod<List<Object?>>(
+      'learnPhoto',
+      {
+        'path': photoPath,
+        'boxes': boxes.map((box) => [box.left, box.top, box.right, box.bottom]).toList(),
+      },
+    );
+    final photoSamples = (samples ?? const <List<Object?>>[])
+        .map((sample) => sample.cast<num>().map((v) => v.toDouble()).toList())
+        .where(hasShape)
+        .toList();
+    // Only complete vectors are cached; without an embedding it is retried next time.
+    if (photoSamples.isNotEmpty &&
+        photoSamples.every((sample) => sample.length > basicFeatureLength)) {
+      try {
+        final pending = File('${cache.path}.tmp');
+        await pending.writeAsString(jsonEncode({
+          'version': _featureCacheVersion,
+          'annotation': annotation,
+          'samples': photoSamples,
+        }), flush: true);
+        await pending.rename(cache.path);
+      } catch (_) {
+        // The cache is only an optimisation.
+      }
+    }
+    return photoSamples;
+  }
 
   _Detection _matchLocal(_Detection detection) {
     final appearance = detection.appearance;
-    if (!_hasShape(appearance) || _examples.isEmpty) return detection;
-    final distancesByClass = <String, List<double>>{};
-    for (final entry in _examples.entries) {
-      final distances = entry.value.map((photo) {
-        var nearest = double.infinity;
-        for (final reference in photo) {
-          var shape = 0.0;
-          var color = 0.0;
-          for (var i = 0; i < 56; i++) {
-            final difference = (appearance[i] - reference[i]).abs();
-            if (i < 32) {
-              shape += difference;
-            } else {
-              color += difference;
-            }
-          }
-          final basic = (0.85 * shape + 0.15 * color) / 2;
-          var distance = basic;
-          if (appearance.length > 56 && appearance.length == reference.length) {
-            var cosine = 0.0;
-            for (var i = 56; i < appearance.length; i++) {
-              cosine += appearance[i] * reference[i];
-            }
-            final embeddingDistance = (1 - cosine.clamp(-1.0, 1.0)) / 2;
-            distance = 0.8 * embeddingDistance + 0.2 * basic;
-          } else if (appearance.length != reference.length) {
-            // A missing embedding cannot overrule evidence from the model.
-            continue;
-          }
-          if (distance < nearest) nearest = distance;
-        }
-        return nearest;
-      }).toList();
-      distancesByClass[entry.key] = distances;
-    }
+    if (!hasShape(appearance) || _examples.isEmpty) return detection;
     final bestLabel = selectLocalObjectLabel(
-      distancesByClass,
+      distancesByClass(appearance, _examples),
       maximumDistance: detection.score < 0.5 ? 0.19 : 0.25,
     );
     if (bestLabel == null) return detection;
@@ -332,8 +345,11 @@ class _DetectionScreenState extends State<DetectionScreen>
           _detections = focus ? _confirmedFocus(candidates) : candidates;
         });
       }
+      _frameFailures.succeed();
     } catch (error) {
-      if (_current(generation)) {
+      // A single bad frame is skipped; only repeated failures stop the camera.
+      if (_frameFailures.fail() && _current(generation)) {
+        _frameFailures.succeed();
         setState(() => _error = 'Deteksi gagal. $error');
       }
     } finally {
@@ -484,18 +500,14 @@ class _DetectionScreenState extends State<DetectionScreen>
         request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $key');
         request.write(jsonEncode({
           'model': model,
-          'max_tokens': 2048,
+          'max_tokens': 8192, // Room for reasoning tokens of newer models.
           'messages': [
             {
               'role': 'user',
               'content': [
                 {
                   'type': 'text',
-                  'text': 'Find visible instances of the object class "$label". '
-                      'A face is a generic class. Never identify a person. '
-                      'Return only JSON {"boxes":[[left,top,right,bottom]]}. '
-                      'Coordinates are numbers between 0 and 1 relative to the '
-                      'full image. If none is visible, return {"boxes":[]}.',
+                  'text': aiBoxPrompt(label),
                 },
                 {
                   'type': 'image_url',
@@ -511,13 +523,7 @@ class _DetectionScreenState extends State<DetectionScreen>
         }
         return utf8.decoder.bind(response).join();
       })().timeout(const Duration(seconds: 45));
-      final envelope = jsonDecode(reply) as Map<String, dynamic>;
-      final choices = envelope['choices'] as List<dynamic>;
-      final content = (choices.first['message']['content'] as String).trim();
-      final json = content
-          .replaceFirst(RegExp(r'^\s*```(?:json)?\s*'), '')
-          .replaceFirst(RegExp(r'\s*```\s*$'), '');
-      return _parseBoxes(json, limit: true);
+      return parseAiBoxes(completionText(reply));
     } finally {
       client.close(force: true);
     }
@@ -650,21 +656,6 @@ class _DetectionScreenState extends State<DetectionScreen>
   }
 }
 
-List<Rect> _parseBoxes(String json, {bool limit = false}) {
-  final rows = (jsonDecode(json) as Map<String, dynamic>)['boxes'] as List;
-  if (limit && rows.length > 50) throw const FormatException('Too many boxes');
-  return rows.map<Rect>((row) {
-    if (row is! List || row.length != 4 ||
-        row.any((v) => v is! num || !v.isFinite || v < 0 || v > 1)) {
-      throw const FormatException('Invalid coordinates');
-    }
-    final values = row.cast<num>().map((v) => v.toDouble()).toList();
-    final box = Rect.fromLTRB(values[0], values[1], values[2], values[3]);
-    if (box.isEmpty) throw const FormatException('Empty box');
-    return box;
-  }).toList();
-}
-
 class _DatasetGallery extends StatefulWidget {
   const _DatasetGallery();
 
@@ -689,8 +680,110 @@ class _DatasetGalleryState extends State<_DatasetGallery> {
   }
 
   bool _editing = false;
+  bool _exporting = false;
 
-  void _showEditError(String message) {
+  Future<bool> _confirm(String title, String message) async =>
+      await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Batal'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Hapus'),
+            ),
+          ],
+        ),
+      ) ==
+      true;
+
+  Future<void> _deletePhoto(File photo) async {
+    if (_editing || _exporting) return;
+    if (!await _confirm('Hapus foto?', 'Foto dan anotasinya dihapus dari HP.')) return;
+    try {
+      for (final suffix in ['', '.json', '.vec.json']) {
+        final file = File('${photo.path}$suffix');
+        if (await file.exists()) await file.delete();
+      }
+    } catch (_) {
+      _notify('Foto gagal dihapus.');
+    }
+    if (mounted) setState(() => _photos = _load());
+  }
+
+  Future<void> _deleteClass(String label, Directory directory) async {
+    if (_editing || _exporting) return;
+    if (!await _confirm('Hapus kelas "$label"?',
+        'Semua foto dan anotasi kelas ini dihapus dari HP.')) {
+      return;
+    }
+    try {
+      await directory.delete(recursive: true);
+    } catch (_) {
+      _notify('Kelas gagal dihapus.');
+    }
+    if (mounted) setState(() => _photos = _load());
+  }
+
+  /// Exports annotated photos as a ZIP with YOLO labels and a COCO JSON file.
+  Future<void> _export() async {
+    if (_editing || _exporting) return;
+    setState(() => _exporting = true);
+    try {
+      final photos = await _load();
+      final annotated = <(File, String, List<Rect>)>[];
+      for (final photo in photos) {
+        final annotation = File('${photo.path}.json');
+        if (!await annotation.exists()) continue;
+        try {
+          final label = photo.parent.uri.pathSegments.reversed
+              .firstWhere((segment) => segment.isNotEmpty);
+          annotated.add((photo, label, parseBoxes(await annotation.readAsString())));
+        } catch (_) {
+          // Damaged annotations are left out of the export.
+        }
+      }
+      if (annotated.isEmpty) {
+        _notify('Belum ada foto beranotasi untuk diekspor.');
+        return;
+      }
+      final classes = annotated.map((item) => item.$2).toSet().toList()..sort();
+      final texts = <String, String>{'data.yaml': yoloDataYaml(classes)};
+      final items = <Map<String, Object>>[];
+      for (final (photo, label, boxes) in annotated) {
+        final base = '${label.replaceAll(' ', '_')}__'
+            '${photo.uri.pathSegments.last.replaceAll('.jpg', '')}';
+        final classIndex = classes.indexOf(label);
+        texts['labels/$base.txt'] = yoloLabel(classIndex, boxes);
+        items.add({
+          'path': photo.path,
+          'name': '$base.jpg',
+          'classIndex': classIndex,
+          'boxes': boxes.map((b) => [b.left, b.top, b.right, b.bottom]).toList(),
+        });
+      }
+      final location = await const MethodChannel('object_detection/detector')
+          .invokeMethod<String>('exportDataset', {
+        'classes': classes,
+        'items': items,
+        'texts': texts,
+        'fileName': 'dataset_${DateTime.now().millisecondsSinceEpoch}.zip',
+      });
+      _notify('${items.length} foto diekspor ke $location '
+          '(format YOLO + COCO).');
+    } catch (_) {
+      _notify('Ekspor gagal. Coba lagi.');
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
+  void _notify(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
@@ -705,10 +798,10 @@ class _DatasetGalleryState extends State<_DatasetGallery> {
       final List<Rect> boxes;
       try {
         boxes = await annotation.exists()
-            ? _parseBoxes(await annotation.readAsString())
+            ? parseBoxes(await annotation.readAsString())
             : <Rect>[];
       } catch (_) {
-        _showEditError('Anotasi lama gagal dibaca. File asli tetap tersimpan.');
+        _notify('Anotasi lama gagal dibaca. File asli tetap tersimpan.');
         return;
       }
       if (!mounted) return;
@@ -716,7 +809,7 @@ class _DatasetGalleryState extends State<_DatasetGallery> {
       try {
         result = await _openEditor(context, photo, label, boxes);
       } catch (_) {
-        _showEditError('Foto gagal dibuka di editor.');
+        _notify('Foto gagal dibuka di editor.');
         return;
       }
       if (result == null) return;
@@ -724,7 +817,7 @@ class _DatasetGalleryState extends State<_DatasetGallery> {
         await _saveAnnotation(photo, label, result);
         if (mounted) setState(() => _photos = _load());
       } catch (_) {
-        _showEditError('Perubahan anotasi gagal disimpan.');
+        _notify('Perubahan anotasi gagal disimpan.');
       }
     } finally {
       _editing = false;
@@ -734,7 +827,22 @@ class _DatasetGalleryState extends State<_DatasetGallery> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Galeri dataset')),
+      appBar: AppBar(
+        title: const Text('Galeri dataset'),
+        actions: [
+          IconButton(
+            tooltip: 'Ekspor dataset (ZIP YOLO + COCO)',
+            onPressed: _exporting ? null : _export,
+            icon: _exporting
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.ios_share),
+          ),
+        ],
+      ),
       body: FutureBuilder<List<File>>(
         future: _photos,
         builder: (context, snapshot) {
@@ -765,6 +873,11 @@ class _DatasetGalleryState extends State<_DatasetGallery> {
                 ExpansionTile(
                   title: Text(group.key),
                   subtitle: Text('${group.value.length} foto'),
+                  trailing: IconButton(
+                    tooltip: 'Hapus kelas',
+                    onPressed: () => _deleteClass(group.key, group.value.first.parent),
+                    icon: const Icon(Icons.delete_outline),
+                  ),
                   children: [
                     for (final photo in group.value)
                       ListTile(
@@ -780,7 +893,11 @@ class _DatasetGalleryState extends State<_DatasetGallery> {
                         subtitle: Text(File('${photo.path}.json').existsSync()
                             ? 'Sudah dianotasi'
                             : 'Belum dianotasi'),
-                        trailing: const Icon(Icons.edit_outlined),
+                        trailing: IconButton(
+                          tooltip: 'Hapus foto',
+                          onPressed: () => _deletePhoto(photo),
+                          icon: const Icon(Icons.delete_outline),
+                        ),
                         onTap: () => _edit(photo, group.key),
                       ),
                   ],
@@ -1082,7 +1199,7 @@ class _OpenRouterSettingsDialogState extends State<_OpenRouterSettingsDialog> {
               onPressed: () => _model.text = widget.defaultModel,
               child: const Text('Gunakan model bawaan'),
             ),
-            const Text('Pilih model yang menerima input foto. Pengaturan disimpan di HP.'),
+            const Text('Pilih model yang menerima input foto, sebaiknya keluarga Gemini atau Qwen-VL. Pengaturan disimpan di HP.'),
           ],
         ),
       ),
@@ -1152,38 +1269,6 @@ class _ExampleLabelDialogState extends State<_ExampleLabelDialog> {
   }
 }
 
-// Each distance represents the closest annotated box in one distinct photo.
-String? selectLocalObjectLabel(
-  Map<String, List<double>> distancesByClass, {
-  required double maximumDistance,
-}) {
-  final ranked = <({String label, double score, double secondPhoto})>[];
-  for (final entry in distancesByClass.entries) {
-    final distances = entry.value.where((value) => value.isFinite && value >= 0).toList()
-      ..sort();
-    if (distances.length < 3) continue;
-    ranked.add((
-      label: entry.key,
-      score: .3 * distances[0] + .5 * distances[1] + .2 * distances[2],
-      secondPhoto: distances[1],
-    ));
-  }
-  if (ranked.isEmpty) return null;
-  ranked.sort((a, b) => a.score.compareTo(b.score));
-  final best = ranked.first;
-  if (best.score > maximumDistance || best.secondPhoto > maximumDistance) {
-    return null;
-  }
-  if (ranked.length > 1) {
-    final runnerUp = ranked[1];
-    if (runnerUp.score - best.score < 0.05 ||
-        best.score > runnerUp.score * 0.8) {
-      return null;
-    }
-  }
-  return best.label;
-}
-
 class _Detection {
   const _Detection(this.box, this.label, this.score, this.appearance, {this.local = false});
 
@@ -1219,15 +1304,6 @@ class _Overlay extends CustomPainter {
 
   final List<_Detection> detections;
   static const _accent = Color(0xff79ebbb);
-  static const _labels = {
-    'person': 'Orang',
-    'car': 'Mobil',
-    'motorcycle': 'Motor',
-    'bottle': 'Botol',
-    'chair': 'Kursi',
-    'cup': 'Cangkir',
-    'cell phone': 'Ponsel',
-  };
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1256,7 +1332,7 @@ class _Overlay extends CustomPainter {
       ).intersect(Offset.zero & size);
       if (rect.isEmpty) continue;
       canvas.drawRect(rect, border);
-      final label = _labels[detection.label] ?? detection.label;
+      final label = cocoLabelsId[detection.label] ?? detection.label;
       final text = TextPainter(
         text: TextSpan(
           text: detection.local ? '$label · contoh' : '$label ${(100 * detection.score).round()}%',

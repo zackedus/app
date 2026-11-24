@@ -2,6 +2,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:object_detection/main.dart';
+import 'package:object_detection/src/matching.dart';
 
 void main() {
   test('accepts a class supported by distinct photos', () {

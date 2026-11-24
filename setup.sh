@@ -9,9 +9,9 @@ fi
 
 flutter create --no-pub --platforms=android --org id.rancangpro "$project"
 cp pubspec.yaml "$project/pubspec.yaml"
-cp lib/main.dart "$project/lib/main.dart"
+cp -R lib/. "$project/lib/"
 rm "$project/test/widget_test.dart"
-cp test/detection_screen_test.dart "$project/test/detection_screen_test.dart"
+cp test/*.dart "$project/test/"
 rm "$project/analysis_options.yaml"
 app="$project/android/app"
 mkdir -p "$app/src/main/assets"
@@ -48,7 +48,7 @@ source = gradle.read_text()
 assert "android {" in source and "minSdk = flutter.minSdkVersion" in source
 source = source.replace("android {", 'android {\n    androidResources {\n        noCompress += "tflite"\n    }\n', 1)
 source = source.replace("minSdk = flutter.minSdkVersion", "minSdk = maxOf(flutter.minSdkVersion, 24)", 1)
-source += '\ndependencies {\n    implementation("org.tensorflow:tensorflow-lite-task-vision:0.4.4")\n    implementation("com.google.mediapipe:tasks-vision:0.10.21") {\n        exclude(group = "com.google.auto.value", module = "auto-value")\n    }\n    implementation("com.google.auto.value:auto-value-annotations:1.11.0")\n}\n'
+source += '\ndependencies {\n    implementation("com.google.mediapipe:tasks-vision:0.10.33") {\n        exclude(group = "com.google.auto.value", module = "auto-value")\n    }\n    implementation("com.google.auto.value:auto-value-annotations:1.11.0")\n}\n'
 if os.environ.get("ANDROID_RELEASE") == "1":
     base_id = 'applicationId = "id.rancangpro.object_detection"'
     debug_signing = 'signingConfig = signingConfigs.getByName("debug")'

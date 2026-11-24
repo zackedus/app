@@ -3,7 +3,19 @@ package id.rancangpro.object_detection
 import android.graphics.Bitmap
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.imageembedder.ImageEmbedder
+import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
+import android.content.ContentValues
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.OutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlin.math.ceil
 import kotlin.math.floor
 import android.security.keystore.KeyGenParameterSpec
@@ -15,26 +27,21 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
 import android.graphics.Matrix
-import android.graphics.Rect
 import android.graphics.RectF
 import kotlin.math.roundToInt
 import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.PI
-import android.graphics.YuvImage
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
-import org.tensorflow.lite.support.image.TensorImage
-import org.tensorflow.lite.task.vision.detector.ObjectDetector
-import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
     private val worker = Executors.newSingleThreadExecutor()
+    private val exportWorker = Executors.newSingleThreadExecutor()
     private var detector: ObjectDetector? = null
     private var embedder: ImageEmbedder? = null
     private var embeddingUnavailable = false
@@ -48,13 +55,20 @@ class MainActivity : FlutterActivity() {
             "object_detection/detector"
         ).also { bridge ->
             bridge.setMethodCallHandler { call, result ->
-                if (call.method != "detect" && call.method != "learnPhoto") {
+                if (call.method != "detect" && call.method != "learnPhoto" &&
+                    call.method != "exportDataset") {
                     result.notImplemented()
                     return@setMethodCallHandler
                 }
-                worker.execute {
+                // Export can take a while, so it runs outside the frame worker.
+                val executor = if (call.method == "exportDataset") exportWorker else worker
+                executor.execute {
                     try {
-                        val detections = if (call.method == "detect") detect(call) else learnPhoto(call)
+                        val detections = when (call.method) {
+                            "detect" -> detect(call)
+                            "learnPhoto" -> learnPhoto(call)
+                            else -> exportDataset(call)
+                        }
                         runOnUiThread { result.success(detections) }
                     } catch (error: Exception) {
                         runOnUiThread { result.error("DETECT", error.message, null) }
@@ -145,22 +159,20 @@ class MainActivity : FlutterActivity() {
         val rotation = requireNotNull(call.argument<Int>("rotation"))
         val focus = call.argument<Boolean>("focus") == true
         val compareExamples = call.argument<Boolean>("compareExamples") == true
-        val model = detector ?: ObjectDetector.createFromFileAndOptions(
+        val model = detector ?: ObjectDetector.createFromOptions(
             applicationContext,
-            "model.tflite",
             ObjectDetector.ObjectDetectorOptions.builder()
+                .setBaseOptions(BaseOptions.builder().setModelAssetPath("model.tflite").build())
+                .setRunningMode(RunningMode.IMAGE)
                 .setMaxResults(16)
                 .setScoreThreshold(0.20f)
                 .build()
         ).also { detector = it }
 
-        val jpeg = ByteArrayOutputStream()
-        val yuv = YuvImage(bytes, ImageFormat.NV21, width, height, null)
-        check(yuv.compressToJpeg(Rect(0, 0, width, height), 85, jpeg))
-        val encoded = jpeg.toByteArray()
-        val bitmap = checkNotNull(BitmapFactory.decodeByteArray(encoded, 0, encoded.size))
+        require(width > 0 && height > 0 && bytes.size == width * height * 3 / 2)
+        val bitmap = nv21ToBitmap(bytes, width, height)
         try {
-            val upright = Bitmap.createBitmap(
+            val upright = if (rotation % 360 == 0) bitmap else Bitmap.createBitmap(
                 bitmap, 0, 0, bitmap.width, bitmap.height,
                 Matrix().apply { postRotate(rotation.toFloat()) }, true
             )
@@ -172,13 +184,19 @@ class MainActivity : FlutterActivity() {
                     )
                     return listOf(candidate(upright, box, "", 0.0, true))
                 }
-                return model.detect(TensorImage.fromBitmap(upright)).mapIndexedNotNull { index, detection ->
-                    val category = detection.categories.maxByOrNull { it.score }
-                        ?: return@mapIndexedNotNull null
-                    candidate(
-                        upright, detection.boundingBox, category.label,
-                        category.score.toDouble(), compareExamples && index < 4
-                    )
+                // Closing an MPImage may recycle its bitmap, so close it only after all crops.
+                val input = BitmapImageBuilder(upright).build()
+                try {
+                    return model.detect(input).detections().mapNotNull { detection ->
+                        val category = detection.categories().maxByOrNull { it.score() }
+                            ?: return@mapNotNull null
+                        Triple(detection.boundingBox(), category.categoryName(), category.score())
+                    }.sortedByDescending { it.third }.mapIndexed { index, (box, label, score) ->
+                        // The UI shows at most eight boxes, so each of them can match examples.
+                        candidate(upright, box, label, score.toDouble(), compareExamples && index < 8)
+                    }
+                } finally {
+                    input.close()
                 }
             } finally {
                 if (upright !== bitmap) upright.recycle()
@@ -186,6 +204,35 @@ class MainActivity : FlutterActivity() {
         } finally {
             bitmap.recycle()
         }
+    }
+
+    // Converts an NV21 camera frame directly to ARGB (BT.601), avoiding a lossy JPEG round trip.
+    private fun nv21ToBitmap(data: ByteArray, width: Int, height: Int): Bitmap {
+        val frameSize = width * height
+        val argb = IntArray(frameSize)
+        var yIndex = 0
+        for (row in 0 until height) {
+            var uvIndex = frameSize + (row shr 1) * width
+            var u = 0
+            var v = 0
+            for (column in 0 until width) {
+                val luma = ((data[yIndex].toInt() and 0xff) - 16).coerceAtLeast(0)
+                if (column and 1 == 0) {
+                    v = (data[uvIndex++].toInt() and 0xff) - 128
+                    u = (data[uvIndex++].toInt() and 0xff) - 128
+                }
+                val scaled = 1192 * luma
+                val red = (scaled + 1634 * v).coerceIn(0, 262143)
+                val green = (scaled - 833 * v - 400 * u).coerceIn(0, 262143)
+                val blue = (scaled + 2066 * u).coerceIn(0, 262143)
+                argb[yIndex] = -0x1000000 or
+                    ((red shl 6) and 0xff0000) or
+                    ((green shr 2) and 0xff00) or
+                    ((blue shr 10) and 0xff)
+                yIndex++
+            }
+        }
+        return Bitmap.createBitmap(argb, width, height, Bitmap.Config.ARGB_8888)
     }
 
     private fun candidate(
@@ -202,17 +249,9 @@ class MainActivity : FlutterActivity() {
 
     private fun learnPhoto(call: MethodCall): List<List<Double>> {
         val path = requireNotNull(call.argument<String>("path"))
-        require(path.startsWith(filesDir.parentFile!!.absolutePath + "/"))
+        requireAppFile(path)
         val boxes = requireNotNull(call.argument<List<List<Number>>>("boxes"))
-        val photo = if (android.os.Build.VERSION.SDK_INT >= 28) {
-            android.graphics.ImageDecoder.decodeBitmap(
-                android.graphics.ImageDecoder.createSource(java.io.File(path))
-            ) { decoder, _, _ ->
-                decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
-            }
-        } else {
-            checkNotNull(BitmapFactory.decodeFile(path))
-        }
+        val photo = decodePhoto(path)
         try {
             return boxes.map { box ->
                 appearance(photo, RectF(
@@ -224,6 +263,126 @@ class MainActivity : FlutterActivity() {
             }
         } finally {
             photo.recycle()
+        }
+    }
+
+    private fun requireAppFile(path: String) {
+        val root = filesDir.parentFile!!.canonicalPath + "/"
+        require(File(path).canonicalPath.startsWith(root))
+    }
+
+    private fun decodePhoto(path: String): Bitmap =
+        if (Build.VERSION.SDK_INT >= 28) {
+            android.graphics.ImageDecoder.decodeBitmap(
+                android.graphics.ImageDecoder.createSource(File(path))
+            ) { decoder, _, _ ->
+                decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+            }
+        } else {
+            checkNotNull(BitmapFactory.decodeFile(path))
+        }
+
+    // Writes images, YOLO labels, data.yaml and a COCO JSON file into one ZIP in Downloads.
+    private fun exportDataset(call: MethodCall): String {
+        val classes = requireNotNull(call.argument<List<String>>("classes"))
+        val items = requireNotNull(call.argument<List<Map<String, Any>>>("items"))
+        val texts = requireNotNull(call.argument<Map<String, String>>("texts"))
+        val fileName = requireNotNull(call.argument<String>("fileName"))
+        require(Regex("^[A-Za-z0-9_.-]+\\.zip$").matches(fileName))
+        items.forEach { requireAppFile(it["path"] as String) }
+
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/DeteksiObjek")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = checkNotNull(contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values))
+            try {
+                checkNotNull(contentResolver.openOutputStream(uri)).use { writeDataset(it, classes, items, texts) }
+                values.clear()
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+            } catch (error: Exception) {
+                contentResolver.delete(uri, null, null)
+                throw error
+            }
+            return "Download/DeteksiObjek/$fileName"
+        }
+        val directory = checkNotNull(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS))
+        val output = File(directory, fileName)
+        val pending = File(directory, "$fileName.tmp")
+        try {
+            pending.outputStream().use { writeDataset(it, classes, items, texts) }
+            check(pending.renameTo(output))
+        } finally {
+            pending.delete()
+        }
+        return output.absolutePath
+    }
+
+    private fun writeDataset(
+        stream: OutputStream,
+        classes: List<String>,
+        items: List<Map<String, Any>>,
+        texts: Map<String, String>,
+    ) {
+        val images = JSONArray()
+        val annotations = JSONArray()
+        var annotationId = 1
+        ZipOutputStream(stream.buffered()).use { zip ->
+            for ((name, text) in texts) {
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(text.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+            items.forEachIndexed { index, item ->
+                val photo = decodePhoto(item["path"] as String)
+                val width = photo.width
+                val height = photo.height
+                try {
+                    // Re-encoding stores pixels upright, so boxes match without EXIF handling.
+                    zip.putNextEntry(ZipEntry("images/${item["name"]}"))
+                    check(photo.compress(Bitmap.CompressFormat.JPEG, 95, zip))
+                    zip.closeEntry()
+                } finally {
+                    photo.recycle()
+                }
+                val imageId = index + 1
+                images.put(JSONObject()
+                    .put("id", imageId)
+                    .put("file_name", item["name"])
+                    .put("width", width)
+                    .put("height", height))
+                @Suppress("UNCHECKED_CAST")
+                val boxes = item["boxes"] as List<List<Number>>
+                val category = (item["classIndex"] as Number).toInt() + 1
+                for (box in boxes) {
+                    val left = box[0].toDouble() * width
+                    val top = box[1].toDouble() * height
+                    val boxWidth = (box[2].toDouble() - box[0].toDouble()) * width
+                    val boxHeight = (box[3].toDouble() - box[1].toDouble()) * height
+                    annotations.put(JSONObject()
+                        .put("id", annotationId++)
+                        .put("image_id", imageId)
+                        .put("category_id", category)
+                        .put("bbox", JSONArray(listOf(left, top, boxWidth, boxHeight)))
+                        .put("area", boxWidth * boxHeight)
+                        .put("iscrowd", 0))
+                }
+            }
+            val categories = JSONArray()
+            classes.forEachIndexed { index, name ->
+                categories.put(JSONObject().put("id", index + 1).put("name", name))
+            }
+            zip.putNextEntry(ZipEntry("annotations_coco.json"))
+            zip.write(JSONObject()
+                .put("images", images)
+                .put("annotations", annotations)
+                .put("categories", categories)
+                .toString().toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
         }
     }
 
@@ -316,7 +475,10 @@ class MainActivity : FlutterActivity() {
             embeddingUnavailable = true
             return emptyList()
         }
-        val crop = Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+        // createBitmap can return the source itself; copy it so closing the input cannot recycle it.
+        val crop = Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top).let {
+            if (it === bitmap) it.copy(Bitmap.Config.ARGB_8888, false) else it
+        }
         try {
             val input = BitmapImageBuilder(crop).build()
             try {
@@ -340,6 +502,7 @@ class MainActivity : FlutterActivity() {
             embedder?.close()
         }
         worker.shutdown()
+        exportWorker.shutdown()
         super.onDestroy()
     }
 }
