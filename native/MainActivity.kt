@@ -15,6 +15,9 @@ import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.RectF
 import kotlin.math.roundToInt
+import kotlin.math.atan2
+import kotlin.math.hypot
+import kotlin.math.PI
 import android.graphics.YuvImage
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -137,8 +140,8 @@ class MainActivity : FlutterActivity() {
             applicationContext,
             "model.tflite",
             ObjectDetector.ObjectDetectorOptions.builder()
-                .setMaxResults(8)
-                .setScoreThreshold(0.5f)
+                .setMaxResults(16)
+                .setScoreThreshold(0.20f)
                 .build()
         ).also { detector = it }
 
@@ -203,26 +206,42 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun appearance(bitmap: Bitmap, box: RectF): List<Double> {
-        val features = ArrayList<Double>(48)
-        for (row in 0 until 4) {
-            for (column in 0 until 4) {
-                val colors = DoubleArray(3)
-                for (y in 0 until 3) {
-                    for (x in 0 until 3) {
-                        val px = (box.left + (column + (x + 0.5) / 3) * box.width() / 4)
-                            .roundToInt().coerceIn(0, bitmap.width - 1)
-                        val py = (box.top + (row + (y + 0.5) / 3) * box.height() / 4)
-                            .roundToInt().coerceIn(0, bitmap.height - 1)
-                        val color = bitmap.getPixel(px, py)
-                        colors[0] += android.graphics.Color.red(color).toDouble()
-                        colors[1] += android.graphics.Color.green(color).toDouble()
-                        colors[2] += android.graphics.Color.blue(color).toDouble()
-                    }
-                }
-                colors.forEach { features.add(it / 2295.0) }
+        val size = 24
+        val luminance = DoubleArray(size * size)
+        val colors = DoubleArray(24)
+        for (y in 0 until size) {
+            for (x in 0 until size) {
+                val px = (box.left + (x + 0.5) * box.width() / size)
+                    .roundToInt().coerceIn(0, bitmap.width - 1)
+                val py = (box.top + (y + 0.5) * box.height() / size)
+                    .roundToInt().coerceIn(0, bitmap.height - 1)
+                val color = bitmap.getPixel(px, py)
+                val red = android.graphics.Color.red(color)
+                val green = android.graphics.Color.green(color)
+                val blue = android.graphics.Color.blue(color)
+                luminance[y * size + x] = .299 * red + .587 * green + .114 * blue
+                val total = (red + green + blue).coerceAtLeast(1)
+                colors[(red * 8 / total).coerceAtMost(7)]++
+                colors[8 + (green * 8 / total).coerceAtMost(7)]++
+                colors[16 + (blue * 8 / total).coerceAtMost(7)]++
             }
         }
-        return features
+        val edges = DoubleArray(32)
+        for (y in 1 until size - 1) {
+            for (x in 1 until size - 1) {
+                val index = y * size + x
+                val dx = luminance[index + 1] - luminance[index - 1]
+                val dy = luminance[index + size] - luminance[index - size]
+                val magnitude = hypot(dx, dy)
+                if (magnitude < 6) continue
+                val angle = (atan2(dy, dx) + PI) % PI
+                val bin = (angle * 8 / PI).toInt().coerceIn(0, 7)
+                val cell = (y / (size / 2)) * 2 + x / (size / 2)
+                edges[cell * 8 + bin] += magnitude
+            }
+        }
+        val edgeSum = edges.sum().coerceAtLeast(1.0)
+        return edges.map { it / edgeSum } + colors.map { it / (3 * size * size) }
     }
 
     override fun onDestroy() {
