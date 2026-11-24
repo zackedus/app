@@ -183,9 +183,7 @@ class _DetectionScreenState extends State<DetectionScreen>
   _Detection _matchLocal(_Detection detection) {
     final appearance = detection.appearance;
     if (!_hasShape(appearance) || _examples.isEmpty) return detection;
-    String? bestLabel;
-    var best = double.infinity;
-    var runnerUp = double.infinity;
+    final distancesByClass = <String, List<double>>{};
     for (final entry in _examples.entries) {
       final distances = entry.value.map((photo) {
         var nearest = double.infinity;
@@ -204,20 +202,14 @@ class _DetectionScreenState extends State<DetectionScreen>
           if (distance < nearest) nearest = distance;
         }
         return nearest;
-      }).toList()..sort();
-      // Agreement must come from two different annotated photos.
-      final distance = (distances[0] + distances[1]) / 2;
-      if (distance < best) {
-        runnerUp = best;
-        best = distance;
-        bestLabel = entry.key;
-      } else if (distance < runnerUp) {
-        runnerUp = distance;
-      }
+      }).toList();
+      distancesByClass[entry.key] = distances;
     }
-    if (bestLabel == null || best > (detection.score < 0.5 ? 0.19 : 0.25) || runnerUp - best < 0.06) {
-      return detection;
-    }
+    final bestLabel = selectLocalObjectLabel(
+      distancesByClass,
+      maximumDistance: detection.score < 0.5 ? 0.19 : 0.25,
+    );
+    if (bestLabel == null) return detection;
     return _Detection(detection.box, bestLabel, detection.score, appearance, local: true);
   }
 
@@ -1145,6 +1137,38 @@ class _ExampleLabelDialogState extends State<_ExampleLabelDialog> {
       ],
     );
   }
+}
+
+// Each distance represents the closest annotated box in one distinct photo.
+String? selectLocalObjectLabel(
+  Map<String, List<double>> distancesByClass, {
+  required double maximumDistance,
+}) {
+  final ranked = <({String label, double score, double secondPhoto})>[];
+  for (final entry in distancesByClass.entries) {
+    final distances = entry.value.where((value) => value.isFinite && value >= 0).toList()
+      ..sort();
+    if (distances.length < 3) continue;
+    ranked.add((
+      label: entry.key,
+      score: .3 * distances[0] + .5 * distances[1] + .2 * distances[2],
+      secondPhoto: distances[1],
+    ));
+  }
+  if (ranked.isEmpty) return null;
+  ranked.sort((a, b) => a.score.compareTo(b.score));
+  final best = ranked.first;
+  if (best.score > maximumDistance || best.secondPhoto > maximumDistance) {
+    return null;
+  }
+  if (ranked.length > 1) {
+    final runnerUp = ranked[1];
+    if (runnerUp.score - best.score < 0.05 ||
+        best.score > runnerUp.score * 0.8) {
+      return null;
+    }
+  }
+  return best.label;
 }
 
 class _Detection {
